@@ -24,6 +24,10 @@ pub enum ReaderError {
     NotConnected,
     #[error("pcsc error: {0}")]
     Pcsc(String),
+    #[error("usb error: {0}")]
+    Usb(String),
+    #[error("protocol error: {0}")]
+    Protocol(String),
     #[error("other: {0}")]
     Other(String),
 }
