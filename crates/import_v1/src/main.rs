@@ -11,7 +11,8 @@ mod tests {
     use pasori_core::WORKSPACE_STATUS;
 
     #[test]
-    fn import_v1はcoreに依存できる() {
+    // import_v1 クレートは core に依存できる。
+    fn import_v1_can_depend_on_core() {
         assert_eq!(WORKSPACE_STATUS, "ready");
     }
 }

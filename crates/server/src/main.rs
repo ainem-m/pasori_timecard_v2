@@ -12,7 +12,8 @@ mod tests {
     use pasori_core::WORKSPACE_STATUS;
 
     #[test]
-    fn serverはcoreに依存できる() {
+    // server クレートは core に依存できる。
+    fn server_can_depend_on_core() {
         assert_eq!(WORKSPACE_STATUS, "ready");
     }
 }

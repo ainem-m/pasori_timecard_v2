@@ -223,12 +223,16 @@ cargo run -p terminal       # Tauri Dev Window
 
 ### テストコードの書き方
 
-- **テスト名は日本語で仕様を表現する**
+- **テストの仕様記述は日本語で表現する**
+  - Rust など識別子ベースのテストは **英語 ASCII `snake_case` の関数名**を使い、**直前の日本語コメント**で仕様を表現する
+  - Vitest / Jest など表示名ベースのテストは **日本語の表示名**を使う
   ```rust
   #[test]
-  fn 最終打刻が前日なら次は出勤と推定する() { ... }
+  // 最終打刻が前日なら次は出勤と推定する。
+  fn decides_clock_in_when_last_event_was_on_previous_day() { ... }
   #[test]
-  fn 連続スキャン無視時間内の同一カードは重複登録されない() { ... }
+  // 連続スキャン無視時間内の同一カードは重複登録されない。
+  fn ignores_duplicate_scan_within_suppression_window() { ... }
   ```
   ```typescript
   it('締め日が15日なら前月16日から当月15日までが当月扱いになる', () => { ... })
@@ -544,7 +548,7 @@ recent[0].occurred_at.date() == today かつ ClockOut → ClockIn
 - [ ] `cargo clippy -D warnings` が green
 - [ ] `cargo test --workspace` が全て green
 - [ ] 関連フロント (`web/*`) の `lint` / `typecheck` / `test` が green
-- [ ] テスト名が **日本語で仕様として読める**
+- [ ] テストの**仕様記述が日本語で読める**
 - [ ] 監査対象の操作を追加した場合は、現行設定方針に従って `audit_log` 連携を実装
 - [ ] 時刻を扱うコードは `jiff::Zoned` (Asia/Tokyo) を使用 (naive date/time 禁止)
 - [ ] 新 trait / 新エンティティ導入時は `docs/spec/` または `docs/adr/` を同時更新
@@ -586,3 +590,4 @@ Agent がこれらを行った PR は **自動的に差し戻し対象**。
 - `docs/adr/0003-mvp-scope.md` — MVP スコープの定義
 - `docs/adr/0004-tdd-twada.md` — TDD 規約採用
 - `docs/adr/0005-lineworks-full-mvp.md` — LINE WORKS 双方向を MVP に含める判断
+- `docs/adr/0009-test-name-language-policy.md` — テスト識別子と言語ポリシー

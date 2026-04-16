@@ -10,7 +10,8 @@ mod tests {
     use crate::WORKSPACE_STATUS;
 
     #[test]
-    fn workspace準備状態はreadyを返す() {
+    // ワークスペース準備状態は ready を返す。
+    fn returns_ready_for_workspace_status() {
         assert_eq!(WORKSPACE_STATUS, "ready");
     }
 }
