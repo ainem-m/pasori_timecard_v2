@@ -20,10 +20,23 @@
 | `ManualCorrection` | 手動修正 | 管理者が作成した打刻 (`source = manual`)。 |
 | `AttendanceDay` | 日次勤怠 | ある従業員の 1 日分。ペアリングと勤務時間を計算した結果。永続化しない (計算結果)。 |
 | `MonthlyTimesheet` | 月次勤怠表 | 締め日ベースの 1 ヶ月分の集計。 |
+| `YearMonth` | 対象年月 | 月次勤怠表の集計単位。 |
+| `CutoffRule` | 締めルール | `DayOfMonth` または `EndOfMonth`。 |
+| `DayOfMonth` | 日締め | `1..=28` の固定日締め。 |
+| `EndOfMonth` | 月末締め | 当月の最終日を締め日とする。 |
+| `ShiftPlan` | 予定シフト | 実績との比較に使う 1 日分の予定。 |
+| `ShiftMismatch` | シフト差分 | 予定と実績の不一致。 |
+| `ShiftAssignmentStatus` | シフト状態 | `draft` / `published` / `finalized`。 |
 | `ShiftType` | シフト種別 | 通常勤務 / 午前 / 午後 / 休み / 有休 / 特別休暇 / 予備枠。マスタ管理。 |
 | `ShiftAssignment` | 勤務予定 | ある従業員・ある日付のシフト 1 件。`status` = `draft` / `published` / `finalized`。 |
+| `AttendanceRequestType` | 勤怠申請種別 | `correction` / `missing_in` / `missing_out` / `query_attendance` / `query_shift`。 |
+| `AttendanceRequestSource` | 申請経路 | `lineworks` / `ui`。 |
+| `AttendanceRequestStatus` | 申請状態 | `requested` / `auto_approved` / `approved` / `rejected` / `applied` / `cancelled`。 |
 | `AuditLog` | 監査ログ | append-only、DELETE 禁止。 |
 | `AttendanceRequest` | 勤怠申請 | LINE WORKS 経由の修正申請・照会履歴。 |
+| `LineworksCommand` | LINE WORKS コマンド | 受信したテキストを解釈した結果。 |
+| `CorrectionTarget` | 修正対象 | `ClockIn` / `ClockOut` の修正対象。 |
+| `ClockTime` | 打刻時刻 | `HH:MM` 形式の時刻。 |
 | `ExternalAccount` | 外部アカウント | LINE WORKS の送信者 ID と `Employee` の紐付け。 |
 | `AdminUser` | 管理者 | Admin Web にログインできるユーザー。 |
 | `Terminal` | 打刻端末 | Tauri で動作する端末の登録情報。API token を持つ。 |
