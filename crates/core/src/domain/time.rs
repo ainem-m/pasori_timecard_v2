@@ -24,6 +24,14 @@ impl YearMonth {
         self.month
     }
 
+    pub fn to_date(self, day: i8) -> Date {
+        jiff::civil::date(self.year, self.month, day)
+    }
+
+    pub fn days_in_month(self) -> i8 {
+        self.to_date(1).days_in_month()
+    }
+
     pub fn attendance_period(
         self,
         cutoff_rule: CutoffRule,

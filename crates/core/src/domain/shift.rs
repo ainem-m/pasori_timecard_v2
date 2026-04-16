@@ -1,6 +1,39 @@
+use jiff::Zoned;
+use jiff::civil::Date;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShiftType {
+    pub id: Uuid,
+    pub code: String,
+    pub display_name: String,
+    pub planned_start_time: Option<String>, // 'HH:MM'
+    pub planned_end_time: Option<String>,
+    pub default_break_minutes: Option<i32>,
+    pub color: String,
+    pub is_active: bool,
+    pub created_at: Zoned,
+    pub updated_at: Zoned,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShiftAssignment {
+    pub id: Uuid,
+    pub employee_id: Uuid,
+    pub date: Date,
+    pub shift_type_id: Uuid,
+    pub planned_start_at: Option<Zoned>,
+    pub planned_end_at: Option<Zoned>,
+    pub note: Option<String>,
+    pub status: ShiftAssignmentStatus,
+    pub created_at: Zoned,
+    pub updated_at: Zoned,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ShiftAssignmentStatus {
     Draft,
     Published,

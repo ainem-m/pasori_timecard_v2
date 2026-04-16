@@ -1,16 +1,59 @@
 use crate::port::policy::{PunchEventType, RoundingPolicy};
-use jiff::{Zoned, civil::Date};
+use jiff::Zoned;
+use jiff::civil::Date;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 const MINIMUM_REASONABLE_LOOP_MINUTES: i64 = 180;
 const MAXIMUM_CONTINUOUS_WORK_MINUTES: i64 = 24 * 60;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PunchEvent {
+    pub id: Uuid,
+    pub employee_id: Uuid,
+    pub card_id: Option<Uuid>,
     pub event_type: PunchEventType,
     pub occurred_at: Zoned,
+    pub server_recorded_at: Zoned,
+    pub source: String, // 'nfc' / 'manual' / 'import' / 'local_cached'
+    pub correction_reason: Option<String>,
+    pub deleted_at: Option<Zoned>,
+    pub created_at: Zoned,
+    pub updated_at: Zoned,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl PunchEvent {
+    pub fn event_type_label(&self) -> &'static str {
+        match self.event_type {
+            PunchEventType::ClockIn => "出勤",
+            PunchEventType::ClockOut => "退勤",
+            PunchEventType::BreakStart => "休憩開始",
+            PunchEventType::BreakEnd => "休憩終了",
+            PunchEventType::TemporaryOut => "一時外出",
+            PunchEventType::TemporaryReturn => "戻り",
+            PunchEventType::ManualCorrection => "修正",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NewPunchEvent {
+    pub id: Uuid, // Terminal generated
+    pub employee_id: Uuid,
+    pub card_id: Option<Uuid>,
+    pub event_type: PunchEventType,
+    pub occurred_at: Zoned,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PunchPatch {
+    pub event_type: Option<PunchEventType>,
+    pub occurred_at: Option<Zoned>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AttendanceDayStatus {
     Unconfirmed,
     Confirmed,
@@ -105,6 +148,7 @@ mod tests {
     use crate::port::policy::{NoRounding, PunchEventType};
     use jiff::{Zoned, civil::date};
     use proptest::prelude::*;
+    use uuid::Uuid;
 
     #[test]
     // 出勤と退勤が 1 組なら勤務分数を集計し、不整合なしとして扱う。
@@ -308,8 +352,17 @@ mod tests {
         minute: i8,
     ) -> PunchEvent {
         PunchEvent {
+            id: Uuid::now_v7(),
+            employee_id: Uuid::now_v7(),
+            card_id: None,
             event_type,
             occurred_at: tokyo_datetime(year, month, day, hour, minute),
+            server_recorded_at: tokyo_datetime(year, month, day, hour, minute),
+            source: "nfc".to_string(),
+            correction_reason: None,
+            deleted_at: None,
+            created_at: tokyo_datetime(year, month, day, hour, minute),
+            updated_at: tokyo_datetime(year, month, day, hour, minute),
         }
     }
 

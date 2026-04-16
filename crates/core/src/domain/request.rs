@@ -1,6 +1,10 @@
+use jiff::Zoned;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AttendanceRequestType {
     Correction,
     MissingIn,
@@ -9,13 +13,15 @@ pub enum AttendanceRequestType {
     QueryShift,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AttendanceRequestSource {
     LineWorks,
     Ui,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AttendanceRequestStatus {
     Requested,
     AutoApproved,
@@ -23,6 +29,30 @@ pub enum AttendanceRequestStatus {
     Rejected,
     Applied,
     Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttendanceRequest {
+    pub id: Uuid,
+    pub employee_id: Uuid,
+    pub request_type: AttendanceRequestType,
+    pub requested_payload_json: String,
+    pub status: AttendanceRequestStatus,
+    pub requested_via: AttendanceRequestSource,
+    pub requested_at: Zoned,
+    pub reviewed_by_admin_user_id: Option<Uuid>,
+    pub reviewed_at: Option<Zoned>,
+    pub review_note: Option<String>,
+    pub applied_event_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewAttendanceRequest {
+    pub employee_id: Uuid,
+    pub request_type: AttendanceRequestType,
+    pub requested_payload_json: String,
+    pub requested_via: AttendanceRequestSource,
+    pub requested_at: Zoned,
 }
 
 impl AttendanceRequestStatus {

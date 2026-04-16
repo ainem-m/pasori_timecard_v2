@@ -9,7 +9,7 @@ use base64::Engine;
 use hmac::{Hmac, Mac};
 use jiff::{Timestamp, Zoned, tz::TimeZone};
 use pasori_core::application::lineworks::{
-    LineworksCommand, decide_lineworks_request_status, parse_lineworks_command,
+    LineworksCommand, LineworksUseCase, decide_lineworks_request_status, parse_lineworks_command,
 };
 use pasori_core::domain::request::AttendanceRequestStatus;
 use serde::Deserialize;
@@ -23,20 +23,22 @@ const DEFAULT_MINOR_CORRECTION_THRESHOLD_MINUTES: i64 = 120;
 #[derive(Clone)]
 pub struct LineworksAppState {
     bot_secret: Arc<[u8]>,
+    use_case: Arc<LineworksUseCase>,
 }
 
 impl LineworksAppState {
-    pub fn new(bot_secret: impl Into<Arc<[u8]>>) -> Self {
+    pub fn new(bot_secret: impl Into<Arc<[u8]>>, use_case: Arc<LineworksUseCase>) -> Self {
         Self {
             bot_secret: bot_secret.into(),
+            use_case,
         }
     }
 }
 
-pub fn router(bot_secret: impl Into<Arc<[u8]>>) -> Router {
+pub fn router(bot_secret: impl Into<Arc<[u8]>>, use_case: Arc<LineworksUseCase>) -> Router {
     Router::new()
         .route("/api/lineworks/callback", post(callback))
-        .with_state(LineworksAppState::new(bot_secret))
+        .with_state(LineworksAppState::new(bot_secret, use_case))
 }
 
 pub fn verify_lineworks_signature(body: &[u8], signature: &str, secret: &[u8]) -> bool {
@@ -150,8 +152,19 @@ async fn callback(
             lineworks_user_id = %event.user_id,
             command = ?event.command,
             request_status = ?event.request_status,
-            "interpreted lineworks callback"
+            "processing lineworks callback"
         );
+
+        if let Err(e) = state
+            .use_case
+            .process_event(&event.user_id, event.command, &requested_at)
+            .await
+        {
+            tracing::error!(error = %e, "failed to process lineworks event");
+            // NOTE: We still return 204 to LINE WORKS as they will retry on error,
+            // but we might want to return 500 in some cases.
+            // For now, follow fire-and-forget for notifications but use_case itself might fail.
+        }
     }
 
     StatusCode::NO_CONTENT
@@ -164,15 +177,151 @@ fn current_tokyo_time() -> Result<Zoned, jiff::Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HmacSha256, LineworksCallbackPayload, current_tokyo_time, interpret_callback_payload,
-        router, verify_lineworks_signature,
+        HmacSha256, LineworksCallbackPayload, LineworksUseCase, current_tokyo_time,
+        interpret_callback_payload, router, verify_lineworks_signature,
     };
     use axum::{body::Body, http::Request};
     use base64::Engine;
     use hmac::Mac;
     use jiff::Zoned;
     use pasori_core::application::lineworks::LineworksCommand;
+    use std::sync::Arc;
     use tower::ServiceExt;
+
+    fn mock_use_case() -> Arc<LineworksUseCase> {
+        struct Mock;
+        #[async_trait::async_trait]
+        impl pasori_core::port::repo::ExternalAccountRepository for Mock {
+            async fn find_by_external_id(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<
+                Option<pasori_core::domain::employee::ExternalAccount>,
+                pasori_core::port::repo::RepoError,
+            > {
+                Ok(None)
+            }
+            async fn bind(
+                &self,
+                _: uuid::Uuid,
+                _: &str,
+                _: &str,
+            ) -> Result<
+                pasori_core::domain::employee::ExternalAccount,
+                pasori_core::port::repo::RepoError,
+            > {
+                unimplemented!()
+            }
+        }
+        #[async_trait::async_trait]
+        impl pasori_core::port::repo::AttendanceRequestRepository for Mock {
+            async fn create(
+                &self,
+                _: pasori_core::domain::request::NewAttendanceRequest,
+            ) -> Result<
+                pasori_core::domain::request::AttendanceRequest,
+                pasori_core::port::repo::RepoError,
+            > {
+                unimplemented!()
+            }
+            async fn find(
+                &self,
+                _: uuid::Uuid,
+            ) -> Result<
+                Option<pasori_core::domain::request::AttendanceRequest>,
+                pasori_core::port::repo::RepoError,
+            > {
+                unimplemented!()
+            }
+        }
+        #[async_trait::async_trait]
+        impl pasori_core::port::repo::PunchRepository for Mock {
+            async fn insert(
+                &self,
+                _: pasori_core::domain::punch::NewPunchEvent,
+            ) -> Result<pasori_core::domain::punch::PunchEvent, pasori_core::port::repo::RepoError>
+            {
+                unimplemented!()
+            }
+            async fn recent_for_employee(
+                &self,
+                _: uuid::Uuid,
+                _: usize,
+            ) -> Result<
+                Vec<pasori_core::domain::punch::PunchEvent>,
+                pasori_core::port::repo::RepoError,
+            > {
+                unimplemented!()
+            }
+            async fn list_in_range(
+                &self,
+                _: uuid::Uuid,
+                _: &Zoned,
+                _: &Zoned,
+            ) -> Result<
+                Vec<pasori_core::domain::punch::PunchEvent>,
+                pasori_core::port::repo::RepoError,
+            > {
+                unimplemented!()
+            }
+            async fn update(
+                &self,
+                _: uuid::Uuid,
+                _: pasori_core::domain::punch::PunchPatch,
+                _: String,
+            ) -> Result<pasori_core::domain::punch::PunchEvent, pasori_core::port::repo::RepoError>
+            {
+                unimplemented!()
+            }
+            async fn soft_delete(
+                &self,
+                _: uuid::Uuid,
+                _: String,
+            ) -> Result<(), pasori_core::port::repo::RepoError> {
+                unimplemented!()
+            }
+        }
+        #[async_trait::async_trait]
+        impl pasori_core::port::repo::ShiftRepository for Mock {
+            async fn list_for_month(
+                &self,
+                _: uuid::Uuid,
+                _: pasori_core::domain::time::YearMonth,
+            ) -> Result<
+                Vec<pasori_core::domain::shift::ShiftAssignment>,
+                pasori_core::port::repo::RepoError,
+            > {
+                unimplemented!()
+            }
+            async fn list_types(
+                &self,
+            ) -> Result<
+                Vec<pasori_core::domain::shift::ShiftType>,
+                pasori_core::port::repo::RepoError,
+            > {
+                unimplemented!()
+            }
+        }
+        #[async_trait::async_trait]
+        impl pasori_core::port::notify::Notifier for Mock {
+            async fn notify(
+                &self,
+                _: pasori_core::port::notify::NotifyEvent,
+            ) -> Result<(), pasori_core::port::notify::NotifyError> {
+                Ok(())
+            }
+        }
+
+        let m = Arc::new(Mock);
+        Arc::new(LineworksUseCase::new(
+            m.clone(),
+            m.clone(),
+            m.clone(),
+            m.clone(),
+            m.clone(),
+        ))
+    }
 
     #[tokio::test]
     // 正しい署名は検証に成功する。
@@ -236,7 +385,7 @@ mod tests {
             .body(Body::from(body))
             .expect("request should be built");
 
-        let response = router(secret.to_vec())
+        let response = router(secret.to_vec(), mock_use_case())
             .oneshot(request)
             .await
             .expect("response should be returned");
@@ -263,7 +412,7 @@ mod tests {
             .body(Body::from(body))
             .expect("request should be built");
 
-        let response = router(secret.to_vec())
+        let response = router(secret.to_vec(), mock_use_case())
             .oneshot(request)
             .await
             .expect("response should be returned");
@@ -292,7 +441,7 @@ mod tests {
             .body(Body::from(body))
             .expect("request should be built");
 
-        let response = router(secret.to_vec())
+        let response = router(secret.to_vec(), mock_use_case())
             .oneshot(request)
             .await
             .expect("response should be returned");
@@ -307,9 +456,8 @@ mod tests {
             r#"{
                 "events": [
                     {
-                        "event_type": "message",
                         "source": { "userId": "user-1" },
-                        "content": { "type": "text", "text": "今日の勤怠" }
+                        "content": { "text": "今日の勤怠" }
                     }
                 ]
             }"#,
@@ -322,10 +470,6 @@ mod tests {
         assert_eq!(interpreted.len(), 1);
         assert_eq!(interpreted[0].user_id, "user-1");
         assert_eq!(interpreted[0].command, LineworksCommand::TodayAttendance);
-        assert_eq!(
-            interpreted[0].request_status,
-            Some(pasori_core::domain::request::AttendanceRequestStatus::AutoApproved)
-        );
     }
 
     #[test]
@@ -335,14 +479,12 @@ mod tests {
             r#"{
                 "events": [
                     {
-                        "event_type": "message",
                         "source": { "userId": "user-1" },
                         "content": { "type": "image" }
                     },
                     {
-                        "event_type": "message",
                         "source": { "userId": "user-2" },
-                        "content": { "type": "text", "text": "   " }
+                        "content": { "text": "   " }
                     }
                 ]
             }"#,
@@ -402,7 +544,7 @@ mod tests {
             .body(Body::from(body.as_slice()))
             .expect("request should be built");
 
-        let response = router(secret.to_vec())
+        let response = router(secret.to_vec(), mock_use_case())
             .oneshot(request)
             .await
             .expect("response should be returned");

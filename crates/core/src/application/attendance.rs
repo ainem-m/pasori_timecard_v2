@@ -1,9 +1,129 @@
-use crate::domain::punch::{AttendanceDay, PunchEvent};
+use crate::domain::audit::NewAuditLog;
+use crate::domain::employee::Employee;
+use crate::domain::punch::{AttendanceDay, NewPunchEvent, PunchEvent};
 use crate::domain::request::{AttendanceRequestStatus, AttendanceRequestType};
 use crate::domain::time::{CutoffRule, MonthlyTimesheet, TimeDomainError, YearMonth};
-use crate::port::policy::{PunchEventType, RoundingPolicy};
+use crate::port::notify::{Notifier, NotifyEvent};
+use crate::port::policy::{PunchEventRef, PunchEventType, PunchPolicy, RoundingPolicy};
+use crate::port::reader::CardId;
+use crate::port::repo::{AuditLogRepository, CardRepository, EmployeeRepository, PunchRepository};
 use jiff::{Zoned, civil::Date};
+use std::sync::Arc;
 use uuid::Uuid;
+
+pub struct PunchUseCase {
+    employee_repo: Arc<dyn EmployeeRepository>,
+    card_repo: Arc<dyn CardRepository>,
+    punch_repo: Arc<dyn PunchRepository>,
+    audit_repo: Arc<dyn AuditLogRepository>,
+    notifier: Arc<dyn Notifier>,
+    punch_policy: Arc<dyn PunchPolicy>,
+}
+
+impl PunchUseCase {
+    pub fn new(
+        employee_repo: Arc<dyn EmployeeRepository>,
+        card_repo: Arc<dyn CardRepository>,
+        punch_repo: Arc<dyn PunchRepository>,
+        audit_repo: Arc<dyn AuditLogRepository>,
+        notifier: Arc<dyn Notifier>,
+        punch_policy: Arc<dyn PunchPolicy>,
+    ) -> Self {
+        Self {
+            employee_repo,
+            card_repo,
+            punch_repo,
+            audit_repo,
+            notifier,
+            punch_policy,
+        }
+    }
+
+    /// カードスキャン時の解決処理 (Terminal 問い合わせ用)
+    pub async fn resolve_card_scan(
+        &self,
+        card_id: &CardId,
+        now: &Zoned,
+    ) -> anyhow::Result<ResolvedCardScan> {
+        let card = self.card_repo.find(card_id).await?;
+
+        let Some(card) = card else {
+            // 未登録カード
+            self.notifier
+                .notify(NotifyEvent::UnregisteredCardDetected {
+                    card_id: card_id.clone(),
+                    at: now.clone(),
+                })
+                .await?;
+
+            return Ok(ResolvedCardScan::Unregistered {
+                card_id: card_id.clone(),
+            });
+        };
+
+        let employee = self
+            .employee_repo
+            .find(card.employee_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("employee not found for card"))?;
+
+        let recent_events = self.punch_repo.recent_for_employee(employee.id, 5).await?;
+        let recent_refs: Vec<PunchEventRef> = recent_events
+            .iter()
+            .map(|e| PunchEventRef {
+                event_type: e.event_type,
+                occurred_at: e.occurred_at.clone(),
+            })
+            .collect();
+
+        let suggested_type = self.punch_policy.decide(&recent_refs, now);
+
+        Ok(ResolvedCardScan::Registered(Box::new(RegisteredCardScan {
+            employee,
+            recent_events,
+            suggested_type,
+        })))
+    }
+
+    /// 打刻の確定処理
+    pub async fn submit_punch(&self, event: NewPunchEvent) -> anyhow::Result<PunchEvent> {
+        // 保存 (冪等性は repo/DB 層の UNIQUE 制約に任せる想定だが、
+        // 必要ならここで既存チェックを行う)
+        let punch = self.punch_repo.insert(event).await?;
+
+        // 打刻イベントを監査ログに記録
+        let _ = self
+            .audit_repo
+            .append(NewAuditLog {
+                actor_type: "terminal".to_string(),
+                actor_id: None,
+                action: "punch_submitted".to_string(),
+                target_type: "punch_event".to_string(),
+                target_id: Some(punch.id.to_string()),
+                before_json: None,
+                after_json: Some(
+                    serde_json::to_string(&punch).unwrap_or_else(|_| "{}".to_string()),
+                ),
+                metadata_json: None,
+            })
+            .await;
+
+        Ok(punch)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ResolvedCardScan {
+    Registered(Box<RegisteredCardScan>),
+    Unregistered { card_id: CardId },
+}
+
+#[derive(Debug, Clone)]
+pub struct RegisteredCardScan {
+    pub employee: Employee,
+    pub recent_events: Vec<PunchEvent>,
+    pub suggested_type: PunchEventType,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShiftPlanKind {
@@ -175,13 +295,16 @@ fn absolute_minutes_between(a: &Zoned, b: &Zoned) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ShiftMismatch, ShiftPlan, ShiftPlanKind, build_attendance_day, build_monthly_timesheet,
-        compare_with_shift, decide_attendance_request_status,
+        AttendanceDay, Employee, PunchEvent, ShiftMismatch, ShiftPlan, ShiftPlanKind,
+        build_attendance_day, build_monthly_timesheet, compare_with_shift,
+        decide_attendance_request_status,
     };
-    use crate::domain::punch::{AttendanceDay, AttendanceDayStatus, PunchEvent};
+    use crate::domain::punch::{AttendanceDayStatus, NewPunchEvent};
     use crate::domain::request::{AttendanceRequestStatus, AttendanceRequestType};
     use crate::domain::time::{CutoffDay, CutoffRule, TimeDomainError, YearMonth};
     use crate::port::policy::{NoRounding, PunchEventType};
+    use crate::port::reader::CardId;
+    use crate::port::repo::RepoError;
     use jiff::{Zoned, civil::date};
     use proptest::prelude::*;
     use uuid::Uuid;
@@ -496,15 +619,33 @@ mod tests {
 
     fn clock_in(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> PunchEvent {
         PunchEvent {
+            id: Uuid::now_v7(),
+            employee_id: Uuid::now_v7(),
+            card_id: None,
             event_type: PunchEventType::ClockIn,
             occurred_at: tokyo_datetime(year, month, day, hour, minute),
+            server_recorded_at: tokyo_datetime(year, month, day, hour, minute),
+            source: "nfc".to_string(),
+            correction_reason: None,
+            deleted_at: None,
+            created_at: tokyo_datetime(year, month, day, hour, minute),
+            updated_at: tokyo_datetime(year, month, day, hour, minute),
         }
     }
 
     fn clock_out(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> PunchEvent {
         PunchEvent {
+            id: Uuid::now_v7(),
+            employee_id: Uuid::now_v7(),
+            card_id: None,
             event_type: PunchEventType::ClockOut,
             occurred_at: tokyo_datetime(year, month, day, hour, minute),
+            server_recorded_at: tokyo_datetime(year, month, day, hour, minute),
+            source: "nfc".to_string(),
+            correction_reason: None,
+            deleted_at: None,
+            created_at: tokyo_datetime(year, month, day, hour, minute),
+            updated_at: tokyo_datetime(year, month, day, hour, minute),
         }
     }
 
@@ -521,6 +662,227 @@ mod tests {
         let new_minute = i8::try_from(total_minutes % 60).expect("valid minute");
 
         clock_in(year, month, day, new_hour, new_minute)
+    }
+
+    #[tokio::test]
+    // 登録済みカードのスキャンは、対応する従業員と推定種別を返す。
+    async fn resolves_registered_card_scan() {
+        let employee_id = Uuid::now_v7();
+        let card_id = CardId("0123456789ABCDEF".to_string());
+        let employee_repo = Arc::new(MockEmployeeRepo {
+            employee: Some(Employee {
+                id: employee_id,
+                display_name: "田中 太郎".to_string(),
+                employment_type: "regular".to_string(),
+                affiliation: None,
+                is_active: true,
+                note: None,
+                created_at: tokyo_datetime(2026, 4, 1, 0, 0),
+                updated_at: tokyo_datetime(2026, 4, 1, 0, 0),
+            }),
+        });
+        let card_repo = Arc::new(MockCardRepo {
+            card: Some(crate::domain::card::Card {
+                id: Uuid::now_v7(),
+                employee_id,
+                card_identifier: card_id.clone(),
+                card_label: None,
+                is_active: true,
+                created_at: tokyo_datetime(2026, 4, 1, 0, 0),
+                updated_at: tokyo_datetime(2026, 4, 1, 0, 0),
+            }),
+        });
+        let punch_repo = Arc::new(MockPunchRepo);
+        let audit_repo = Arc::new(MockAuditRepo);
+        let notifier = Arc::new(MockNotifier::default());
+        let punch_policy = Arc::new(crate::port::policy::DefaultPunchPolicy);
+
+        let use_case = super::PunchUseCase::new(
+            employee_repo,
+            card_repo,
+            punch_repo,
+            audit_repo,
+            notifier,
+            punch_policy,
+        );
+
+        let now = tokyo_datetime(2026, 4, 16, 9, 0);
+        let resolved = use_case
+            .resolve_card_scan(&card_id, &now)
+            .await
+            .expect("should resolve");
+
+        if let super::ResolvedCardScan::Registered(scan) = resolved {
+            assert_eq!(scan.employee.display_name, "田中 太郎");
+            assert_eq!(scan.suggested_type, PunchEventType::ClockIn);
+        } else {
+            panic!("expected Registered result");
+        }
+    }
+
+    #[tokio::test]
+    // 未登録カードのスキャンは、Unregistered を返し通知を発火する。
+    async fn resolves_unregistered_card_scan() {
+        let card_id = CardId("DEADBEEF".to_string());
+        let employee_repo = Arc::new(MockEmployeeRepo { employee: None });
+        let card_repo = Arc::new(MockCardRepo { card: None });
+        let punch_repo = Arc::new(MockPunchRepo);
+        let audit_repo = Arc::new(MockAuditRepo);
+        let notifier = Arc::new(MockNotifier::default());
+        let punch_policy = Arc::new(crate::port::policy::DefaultPunchPolicy);
+
+        let use_case = super::PunchUseCase::new(
+            employee_repo,
+            card_repo,
+            punch_repo,
+            audit_repo,
+            notifier.clone(),
+            punch_policy,
+        );
+
+        let now = tokyo_datetime(2026, 4, 16, 10, 0);
+        let resolved = use_case
+            .resolve_card_scan(&card_id, &now)
+            .await
+            .expect("should resolve");
+
+        assert!(matches!(
+            resolved,
+            super::ResolvedCardScan::Unregistered { .. }
+        ));
+
+        let events = notifier.events.lock().await;
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            crate::port::notify::NotifyEvent::UnregisteredCardDetected { .. }
+        ));
+    }
+
+    struct MockEmployeeRepo {
+        employee: Option<Employee>,
+    }
+    #[async_trait::async_trait]
+    impl crate::port::repo::EmployeeRepository for MockEmployeeRepo {
+        async fn list_active(&self) -> Result<Vec<Employee>, RepoError> {
+            unimplemented!()
+        }
+        async fn find(&self, _: Uuid) -> Result<Option<Employee>, RepoError> {
+            Ok(self.employee.clone())
+        }
+        async fn find_by_card(&self, _: &CardId) -> Result<Option<Employee>, RepoError> {
+            unimplemented!()
+        }
+        async fn create(
+            &self,
+            _: crate::domain::employee::NewEmployee,
+        ) -> Result<Employee, RepoError> {
+            unimplemented!()
+        }
+        async fn update(
+            &self,
+            _: Uuid,
+            _: crate::domain::employee::EmployeePatch,
+        ) -> Result<Employee, RepoError> {
+            unimplemented!()
+        }
+        async fn deactivate(&self, _: Uuid) -> Result<(), RepoError> {
+            unimplemented!()
+        }
+    }
+
+    struct MockCardRepo {
+        card: Option<crate::domain::card::Card>,
+    }
+    #[async_trait::async_trait]
+    impl crate::port::repo::CardRepository for MockCardRepo {
+        async fn find(&self, _: &CardId) -> Result<Option<crate::domain::card::Card>, RepoError> {
+            Ok(self.card.clone())
+        }
+        async fn bind(&self, _: &CardId, _: Uuid) -> Result<crate::domain::card::Card, RepoError> {
+            unimplemented!()
+        }
+        async fn unbind(&self, _: &CardId) -> Result<(), RepoError> {
+            unimplemented!()
+        }
+    }
+
+    struct MockPunchRepo;
+    #[async_trait::async_trait]
+    impl crate::port::repo::PunchRepository for MockPunchRepo {
+        async fn insert(&self, event: NewPunchEvent) -> Result<PunchEvent, RepoError> {
+            Ok(PunchEvent {
+                id: event.id,
+                employee_id: event.employee_id,
+                card_id: event.card_id,
+                event_type: event.event_type,
+                occurred_at: event.occurred_at.clone(),
+                server_recorded_at: event.occurred_at.clone(),
+                source: event.source,
+                correction_reason: None,
+                deleted_at: None,
+                created_at: event.occurred_at.clone(),
+                updated_at: event.occurred_at.clone(),
+            })
+        }
+        async fn recent_for_employee(
+            &self,
+            _: Uuid,
+            _: usize,
+        ) -> Result<Vec<PunchEvent>, RepoError> {
+            Ok(vec![])
+        }
+        async fn list_in_range(
+            &self,
+            _: Uuid,
+            _: &Zoned,
+            _: &Zoned,
+        ) -> Result<Vec<PunchEvent>, RepoError> {
+            Ok(vec![])
+        }
+        async fn update(
+            &self,
+            _: Uuid,
+            _: crate::domain::punch::PunchPatch,
+            _: String,
+        ) -> Result<PunchEvent, RepoError> {
+            unimplemented!()
+        }
+        async fn soft_delete(&self, _: Uuid, _: String) -> Result<(), RepoError> {
+            unimplemented!()
+        }
+    }
+
+    struct MockAuditRepo;
+    #[async_trait::async_trait]
+    impl crate::port::repo::AuditLogRepository for MockAuditRepo {
+        async fn append(&self, _: crate::domain::audit::NewAuditLog) -> Result<(), RepoError> {
+            Ok(())
+        }
+        async fn list(
+            &self,
+            _: crate::domain::audit::AuditLogFilter,
+        ) -> Result<Vec<crate::domain::audit::AuditLog>, RepoError> {
+            unimplemented!()
+        }
+    }
+
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[derive(Default)]
+    struct MockNotifier {
+        events: Mutex<Vec<crate::port::notify::NotifyEvent>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::port::notify::Notifier for MockNotifier {
+        async fn notify(
+            &self,
+            event: crate::port::notify::NotifyEvent,
+        ) -> Result<(), crate::port::notify::NotifyError> {
+            self.events.lock().await.push(event);
+            Ok(())
+        }
     }
 
     fn tokyo_datetime(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> Zoned {
