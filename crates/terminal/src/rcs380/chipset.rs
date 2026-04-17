@@ -1,9 +1,8 @@
-use super::frame;
+use super::frame::{self, DecodedFrame};
 use super::transport::{Transport, TransportError};
 use pasori_core::port::reader::{CardId, CardScanned, ReaderBackend, ReaderError, ReaderStatus};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -16,8 +15,8 @@ pub enum ChipsetError {
     Frame(#[from] frame::FrameError),
     #[error("protocol error: {0}")]
     Protocol(String),
-    #[error("timeout")]
-    Timeout,
+    #[error("device rejected command (application error frame)")]
+    DeviceRejected,
 }
 
 pub struct Chipset<T: Transport> {
@@ -29,22 +28,65 @@ impl<T: Transport> Chipset<T> {
         Self { transport }
     }
 
-    /// チップセット初期化 (SetCommandType + SwitchRF + InSetRF + InSetProtocol)。
-    pub fn initialize(&self) -> Result<(), ChipsetError> {
-        // Step 1: SetCommandType (通信タイプ 3 = FeliCa)
-        self.send_command_and_recv(&[0xD6, 0x2A, 0x01, 0x03])?;
+    /// ファームウェアバージョンを取得する（疎通確認を兼ねる）。
+    pub fn get_firmware_version(&self) -> Result<String, ChipsetError> {
+        let response = self.send_command_and_recv(&[0xD6, 0x20])?;
+        // response: [D7, 21, ver_minor, ver_major]
+        if response.len() < 4 {
+            return Err(ChipsetError::Protocol(
+                "get_firmware_version response too short".to_string(),
+            ));
+        }
+        let minor = response[2];
+        let major = response[3];
+        Ok(format!("{}.{:02X}", major, minor))
+    }
 
-        // Step 2: SwitchRF (RF ON)
+    /// チップセット初期化 (nfcpy Chipset.__init__ + sense_ttf 互換)
+    pub fn initialize(&self) -> Result<(), ChipsetError> {
+        // Step 1: SetCommandType(1) — Port-100 拡張コマンドモードを有効化
+        self.send_command_and_recv(&[0xD6, 0x2A, 0x01])?;
+
+        // Step 2: GetFirmwareVersion
+        let ver = self.get_firmware_version()?;
+        tracing::info!(fw = %ver, "RC-S380 firmware version");
+
+        // Step 3: GetPDDataVersion (nfcpy Chipset.__init__ で必須)
+        self.send_command_and_recv(&[0xD6, 0x22])?;
+
+        // Step 4: SwitchRF off
         self.send_command_and_recv(&[0xD6, 0x06, 0x00])?;
 
-        // Step 3: InSetRF (212F パラメータ)
+        // Step 5: InSetRF (212F: send_set=1, comm_type=0x01, recv_set=0x0F, recv_comm_type=0x01)
         self.send_command_and_recv(&[0xD6, 0x00, 0x01, 0x01, 0x0F, 0x01])?;
 
-        // Step 4: InSetProtocol (タイムアウト等)
-        let protocol_cmd = [
-            0xD6, 0x02, 0x00, 0x18, 0x01, 0x01, 0x18, 0x02, 0x07, 0x18, 0x03, 0x07, 0x18, 0x04,
-            0x00, 0x18, 0x05, 0x00,
+        // Step 6: InSetProtocol (nfcpy in_set_protocol_defaults — tag-value ペア, END マーカーなし)
+        // nfcpy: bytearray.fromhex("0018 0101 0201 0300 0400 0500 0600 0708 0800 0900
+        //                           0A00 0B00 0C00 0E04 0F00 1000 1100 1200 1306")
+        #[rustfmt::skip]
+        let defaults_payload = [
+            0x00u8, 0x18,  // INITIAL_GUARD_TIME = 24 (0x18)
+            0x01, 0x01,    // ADD_CRC = 1
+            0x02, 0x01,    // CHECK_CRC = 1
+            0x03, 0x00,    // MULTI_CARD = 0
+            0x04, 0x00,    // ADD_PARITY = 0
+            0x05, 0x00,    // CHECK_PARITY = 0
+            0x06, 0x00,    // BITWISE_ANTICOLL = 0
+            0x07, 0x08,    // LAST_BYTE_BIT_COUNT = 8
+            0x08, 0x00,    // MIFARE_CRYPTO = 0
+            0x09, 0x00,    // ADD_SOF = 0
+            0x0A, 0x00,    // CHECK_SOF = 0
+            0x0B, 0x00,    // ADD_EOF = 0
+            0x0C, 0x00,    // CHECK_EOF = 0
+            0x0E, 0x04,    // DEAF_TIME = 4
+            0x0F, 0x00,    // CRM = 0
+            0x10, 0x00,    // CRM_MIN_LEN = 0
+            0x11, 0x00,    // T1_TAG_RRDD = 0
+            0x12, 0x00,    // RFCA = 0
+            0x13, 0x06,    // GUARD_TIME = 6
         ];
+        let mut protocol_cmd = vec![0xD6u8, 0x02];
+        protocol_cmd.extend_from_slice(&defaults_payload);
         self.send_command_and_recv(&protocol_cmd)?;
 
         Ok(())
@@ -52,35 +94,72 @@ impl<T: Transport> Chipset<T> {
 
     /// FeliCa カードをポーリングし、IDm を取得する。
     /// カードが存在しない場合は Ok(None)。
-    pub fn felica_polling(&self, system_code: u16) -> Result<Option<String>, ChipsetError> {
+    /// nfcpy sense_ttf と同じシーケンス: InSetRF → InSetProtocol → InCommRF
+    ///
+    /// `timeout_raw`: InCommRF タイムアウト値 (デバイス単位, ~1ms/unit)
+    pub fn felica_polling(
+        &self,
+        system_code: u16,
+        timeout_raw: u16,
+    ) -> Result<Option<String>, ChipsetError> {
+        // nfcpy sense_ttf: ポーリングごとに InSetRF + InSetProtocol を送る
+        self.send_command_and_recv(&[0xD6, 0x00, 0x01, 0x01, 0x0F, 0x01])?; // InSetRF(212F)
+
+        #[rustfmt::skip]
+        let defaults_payload = [
+            0x00u8, 0x18, 0x01, 0x01, 0x02, 0x01, 0x03, 0x00,
+            0x04, 0x00, 0x05, 0x00, 0x06, 0x00, 0x07, 0x08,
+            0x08, 0x00, 0x09, 0x00, 0x0A, 0x00, 0x0B, 0x00,
+            0x0C, 0x00, 0x0E, 0x04, 0x0F, 0x00, 0x10, 0x00,
+            0x11, 0x00, 0x12, 0x00, 0x13, 0x06,
+        ];
+        let mut proto = vec![0xD6u8, 0x02];
+        proto.extend_from_slice(&defaults_payload);
+        self.send_command_and_recv(&proto)?; // InSetProtocol(defaults)
+
+        // nfcpy: in_set_protocol(initial_guard_time=24) — 2回目
+        self.send_command_and_recv(&[0xD6, 0x02, 0x00, 0x18])?;
+
         let sc_hi = ((system_code >> 8) & 0xFF) as u8;
         let sc_lo = (system_code & 0xFF) as u8;
+        let t_lo = (timeout_raw & 0xFF) as u8;
+        let t_hi = ((timeout_raw >> 8) & 0xFF) as u8;
 
-        let sensf_req = [0x06, 0x04, sc_hi, sc_lo, 0x01, 0x00];
+        // nfcpy default sensf_req: [len=6, 0x00, SC_HI, SC_LO, RC=0x01, TS=0x00]
+        // byte 1 is 0x00 (not 0x04) — matches nfcpy's bytearray.fromhex("00FFFF0100")
+        let sensf_req = [0x06, 0x00, sc_hi, sc_lo, 0x01, 0x00];
 
-        let mut cmd = vec![0xD6, 0x04, 0x6E, 0x00];
+        let mut cmd = vec![0xD6, 0x04, t_lo, t_hi];
         cmd.extend_from_slice(&sensf_req);
 
         let response = self.send_command_and_recv(&cmd)?;
 
-        // レスポンス構造: [D7, 05, STATUS, TIMEOUT, LEN, DATA...]
-        if response.len() < 5 {
+        // InCommRF レスポンス構造 (nfcpy 準拠):
+        // [D7, 05, S1, S2, S3, S4, rec_no, frame_data...]
+        //  0    1   2   3   4   5    6       7+
+        // S1-S4: ステータス (全 0x00 = 成功)
+        // rec_no: 受信フレーム数/バイト数
+        // frame_data: SensF レスポンスフレーム [frame_len, 0x01, IDm(8), PMm(8), ...]
+        if response.len() < 6 {
             return Err(ChipsetError::Protocol("response too short".to_string()));
         }
 
-        let status = response[2];
-        let len = response[4];
-
-        if status != 0x00 || len == 0 {
+        // S1 != 0x00 はタイムアウト/カードなし (0x80 = timeout)
+        if response[2] != 0x00 {
             return Ok(None);
         }
 
-        // DATA の構造: [LEN, 01, IDm(8bytes), PMm(8bytes), ...]
-        if response.len() < 5 + 1 + 8 {
+        // rec_no == 0 はカードなし
+        if response.len() < 7 || response[6] == 0 {
             return Ok(None);
         }
 
-        let idm_start = 6; // skip [D7, 05, STATUS, TIMEOUT, LEN, 01] (first 6 bytes)
+        // SensF レスポンスフレーム: response[7]=frame_len, response[8]=0x01, response[9..17]=IDm
+        if response.len() < 9 + 8 {
+            return Ok(None);
+        }
+
+        let idm_start = 9; // D7(0) 05(1) S1(2) S2(3) S3(4) S4(5) rec_no(6) frame_len(7) resp_code(8)
         let idm_bytes = &response[idm_start..idm_start + 8];
 
         let hex = idm_bytes
@@ -103,37 +182,41 @@ impl<T: Transport> Chipset<T> {
         let frame = frame::encode(cmd);
         self.transport.send(&frame)?;
 
-        let mut ack_buf = vec![0u8; 6];
+        let mut ack_buf = vec![0u8; 256];
         let ack_size = self.transport.recv(&mut ack_buf, 1000)?;
 
-        if ack_size == 6 && ack_buf == vec![0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00] {
-            // ACK 受信
-        } else {
-            return Err(ChipsetError::Protocol(
-                "expected ACK frame".to_string(),
-            ));
+        let is_ack = ack_size == 6 && ack_buf[..6] == [0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00];
+        if !is_ack {
+            // 6バイトACKではなかった場合、これ自体がレスポンスの可能性もある
+            let data = ack_buf[..ack_size].to_vec();
+            return match frame::decode(&data)? {
+                DecodedFrame::Data(p) => Ok(p),
+                DecodedFrame::Ack => Err(ChipsetError::Protocol(
+                    "unexpected ACK as first recv".to_string(),
+                )),
+                DecodedFrame::Error => {
+                    tracing::warn!(cmd = ?cmd, "device rejected (error frame in recv1)");
+                    Err(ChipsetError::DeviceRejected)
+                }
+            };
         }
 
         let mut resp_buf = vec![0u8; 256];
         let resp_size = self.transport.recv(&mut resp_buf, 2500)?;
         resp_buf.truncate(resp_size);
 
-        let payload = frame::decode(&resp_buf)?;
-
-        match payload {
-            Some(p) => {
-                // ステータス検証: レスポンスの 3 番目バイト (index 2) が 0x00 なら成功
-                if p.len() > 2 && p[2] != 0x00 {
-                    return Err(ChipsetError::Protocol(format!(
-                        "non-zero status: 0x{:02X}",
-                        p[2]
-                    )));
-                }
-                Ok(p)
-            }
-            None => Err(ChipsetError::Protocol(
+        match frame::decode(&resp_buf)? {
+            DecodedFrame::Data(p) => Ok(p),
+            DecodedFrame::Ack => Err(ChipsetError::Protocol(
                 "expected data frame, got ACK".to_string(),
             )),
+            DecodedFrame::Error => {
+                tracing::warn!(
+                    "device returned application error frame for cmd: {:02X?}",
+                    cmd
+                );
+                Err(ChipsetError::DeviceRejected)
+            }
         }
     }
 }
@@ -220,7 +303,8 @@ fn poll_loop(
     let transport = match super::transport::UsbTransport::open() {
         Ok(t) => t,
         Err(e) => {
-            *status.lock().expect("status lock") = ReaderStatus::Error(format!("USB open error: {e}"));
+            *status.lock().expect("status lock") =
+                ReaderStatus::Error(format!("USB open error: {e}"));
             return;
         }
     };
@@ -228,25 +312,37 @@ fn poll_loop(
     let chipset = Chipset::new(transport);
 
     if let Err(e) = chipset.initialize() {
-        *status.lock().expect("status lock") = ReaderStatus::Error(format!("initialize error: {e}"));
+        *status.lock().expect("status lock") =
+            ReaderStatus::Error(format!("initialize error: {e}"));
         return;
     }
 
     *status.lock().expect("status lock") = ReaderStatus::Ready;
 
     let mut last_seen: HashMap<String, std::time::Instant> = HashMap::new();
-    let mut use_transport_system_code = false;
+    let mut poll_counter: u32 = 0;
     const SUPPRESSION_WINDOW_SECS: u64 = 5;
+    // iPhone エクスプレスカード対応:
+    // 0xFFFF (全カード) は 10 回に 1 回だけ使い、残り 9 回は 0x0003 (交通系) のみ待受する。
+    // 0xFFFF でポーリングすると iPhone がロック解除を要求するが、
+    // 0x0003 でポーリングすればエクスプレスカードはロック不要で応答する。
+    const WILDCARD_INTERVAL: u32 = 10;
+    const TIMEOUT_SHORT_MS: u16 = 100; // 0xFFFF ポーリング用 (物理カード用、短め)
+    const TIMEOUT_LONG_MS: u16 = 900; // 0x0003 ポーリング用 (iPhone エクスプレス用、長め)
 
     loop {
         if *cancel.borrow() {
             break;
         }
 
-        let system_code = if use_transport_system_code { 0x0003 } else { 0xFFFF };
-        use_transport_system_code = !use_transport_system_code;
+        let (system_code, timeout_raw) = if poll_counter % WILDCARD_INTERVAL == 0 {
+            (0xFFFF_u16, TIMEOUT_SHORT_MS)
+        } else {
+            (0x0003_u16, TIMEOUT_LONG_MS)
+        };
+        poll_counter = poll_counter.wrapping_add(1);
 
-        match chipset.felica_polling(system_code) {
+        match chipset.felica_polling(system_code, timeout_raw) {
             Ok(Some(idm_hex)) => {
                 let now_instant = std::time::Instant::now();
                 let suppress = last_seen
@@ -269,16 +365,13 @@ fn poll_loop(
                 tracing::debug!("polling error: {e}");
             }
         }
-
-        std::thread::sleep(Duration::from_millis(200));
     }
 
     let _ = chipset.shutdown();
 }
 
 fn tokyo_now() -> jiff::Zoned {
-    jiff::Timestamp::now()
-        .to_zoned(jiff::tz::TimeZone::get("Asia/Tokyo").expect("Asia/Tokyo tz"))
+    jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::get("Asia/Tokyo").expect("Asia/Tokyo tz"))
 }
 
 #[cfg(test)]
@@ -298,6 +391,124 @@ mod tests {
     fn subscribe_returns_receiver() {
         let reader = RCS380ReaderBackend::new();
         let _rx = reader.subscribe();
+    }
+
+    fn queue_command_response(transport: &MockTransport, response_payload: &[u8]) {
+        transport.queue_response(vec![0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00]); // ACK
+        transport.queue_response(frame::encode(response_payload)); // 拡張フレーム形式のレスポンス
+    }
+
+    #[test]
+    // get_firmware_version が [D7, 21, 0A, 01] を "1.0A" として返す。
+    fn get_firmware_version_returns_version_string() {
+        let transport = MockTransport::new();
+        queue_command_response(&transport, &[0xD7, 0x21, 0x0A, 0x01]);
+
+        let chipset = Chipset::new(transport);
+        let result = chipset.get_firmware_version();
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+        assert_eq!(result.unwrap(), "1.0A");
+    }
+
+    #[test]
+    // initialize は SetCommandType が失敗すると全体が失敗する。
+    fn initialize_fails_when_set_command_type_fails() {
+        let transport = MockTransport::new();
+        // SetCommandType に対して Error Frame を返す
+        transport.queue_response(vec![0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00]); // ACK
+        transport.queue_response(vec![0x00, 0x00, 0xFF, 0x01, 0xFF, 0x7F, 0x81, 0x00]); // Error Frame
+
+        let chipset = Chipset::new(transport);
+        let result = chipset.initialize();
+        assert!(matches!(result, Err(ChipsetError::DeviceRejected)));
+    }
+
+    #[test]
+    // デバイスが Error Frame を返したら DeviceRejected として扱う。
+    fn send_command_returns_device_rejected_for_error_frame() {
+        let transport = MockTransport::new();
+        transport.queue_response(vec![0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00]); // ACK
+        transport.queue_response(vec![0x00, 0x00, 0xFF, 0x01, 0xFF, 0x7F, 0x81, 0x00]); // Error Frame
+
+        let chipset = Chipset::new(transport);
+        // get_firmware_version を使って Error Frame を引き起こす
+        let result = chipset.get_firmware_version();
+        assert!(matches!(result, Err(ChipsetError::DeviceRejected)));
+    }
+
+    #[test]
+    // Chipset::initialize に MockTransport で正常レスポンスをセット (nfcpy 互換 6 コマンド)
+    fn chipset_initialize_success() {
+        let transport = MockTransport::new();
+
+        // Step1: SetCommandType(1)
+        queue_command_response(&transport, &[0xD7, 0x2B, 0x00]);
+        // Step2: GetFirmwareVersion
+        queue_command_response(&transport, &[0xD7, 0x21, 0x0A, 0x01]);
+        // Step3: GetPDDataVersion
+        queue_command_response(&transport, &[0xD7, 0x23, 0x00, 0x01]);
+        // Step4: SwitchRF
+        queue_command_response(&transport, &[0xD7, 0x07, 0x00]);
+        // Step5: InSetRF
+        queue_command_response(&transport, &[0xD7, 0x01, 0x00]);
+        // Step6: InSetProtocol
+        queue_command_response(&transport, &[0xD7, 0x03, 0x00]);
+
+        let chipset = Chipset::new(transport);
+        let result = chipset.initialize();
+        assert!(result.is_ok(), "initialize failed: {:?}", result);
+    }
+
+    #[test]
+    // Chipset::felica_polling でカード検出 (nfcpy sense_ttf: InSetRF → InSetProtocol×2 → InCommRF)
+    fn chipset_felica_polling_card_detected() {
+        let transport = MockTransport::new();
+
+        // InSetRF(212F)
+        queue_command_response(&transport, &[0xD7, 0x01, 0x00]);
+        // InSetProtocol(defaults)
+        queue_command_response(&transport, &[0xD7, 0x03, 0x00]);
+        // InSetProtocol(initial_guard_time=24)
+        queue_command_response(&transport, &[0xD7, 0x03, 0x00]);
+
+        // InCommRF → ACK + IDm = [01, FE, 01, 00, 11, 22, 33, 44]
+        let payload = vec![
+            0xD7, 0x05, 0x00, 0x00, 0x00, 0x00, // S1-S4 = success
+            0x01, // rec_no = 1 frame received
+            0x11, // SensF frame_len = 17
+            0x01, // SensF resp_code
+            0x01, 0xFE, 0x01, 0x00, 0x11, 0x22, 0x33, 0x44, // IDm (8 bytes)
+            0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, // PMm (8 bytes)
+        ];
+        queue_command_response(&transport, &payload);
+
+        let chipset = Chipset::new(transport);
+        let result = chipset.felica_polling(0xFFFF, 110);
+        assert!(result.is_ok());
+        let idm = result.unwrap();
+        assert_eq!(idm, Some("01FE010011223344".to_string()));
+    }
+
+    #[test]
+    // Chipset::felica_polling でカード未検出 (S1=0x80 = タイムアウト)
+    fn chipset_felica_polling_no_card() {
+        let transport = MockTransport::new();
+
+        // InSetRF(212F)
+        queue_command_response(&transport, &[0xD7, 0x01, 0x00]);
+        // InSetProtocol(defaults)
+        queue_command_response(&transport, &[0xD7, 0x03, 0x00]);
+        // InSetProtocol(initial_guard_time=24)
+        queue_command_response(&transport, &[0xD7, 0x03, 0x00]);
+
+        // InCommRF → タイムアウト: S1=0x80
+        let payload = vec![0xD7, 0x05, 0x80, 0x00, 0x00, 0x00];
+        queue_command_response(&transport, &payload);
+
+        let chipset = Chipset::new(transport);
+        let result = chipset.felica_polling(0xFFFF, 110);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), None);
     }
 
     #[test]
@@ -323,86 +534,36 @@ mod tests {
             Err(e) => panic!("初期化失敗: {:?}", e),
         }
 
-        println!("カードをタッチしてください...");
-        for system_code in &[0xFFFF, 0x0003] {
-            match chipset.felica_polling(*system_code) {
+        println!("カードをタッチしてください... (10秒待機, 1:9比率ポーリング)");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut detected = false;
+        let mut counter = 0u32;
+        while std::time::Instant::now() < deadline {
+            let (sc, timeout) = if counter % 10 == 0 {
+                (0xFFFF_u16, 100_u16)
+            } else {
+                (0x0003_u16, 900_u16)
+            };
+            counter += 1;
+            match chipset.felica_polling(sc, timeout) {
                 Ok(Some(idm)) => {
-                    println!("✓ カード検出: IDm={}", idm);
-                    return;
+                    println!("✓ カード検出 (sc=0x{:04X}): IDm={}", sc, idm);
+                    detected = true;
+                    break;
                 }
-                Ok(None) => {
-                    println!("  システムコード 0x{:04X}: カードなし", system_code);
-                }
+                Ok(None) => {}
                 Err(e) => {
                     println!("  ポーリング error: {:?}", e);
                 }
             }
+        }
+        if !detected {
+            println!("  (カードなしでシャットダウン)");
         }
 
         match chipset.shutdown() {
             Ok(()) => println!("✓ シャットダウン成功"),
             Err(e) => panic!("シャットダウン失敗: {:?}", e),
         }
-    }
-
-    #[test]
-    // Chipset::initialize に MockTransport で正常レスポンスをセット
-    fn chipset_initialize_success() {
-        let transport = MockTransport::new();
-
-        // 4 つのコマンドに対して ACK + レスポンスを返す
-        // レスポンス: [D7, 2B, 00] (SetCommandType response)
-        let resp = frame::encode(&[0xD7, 0x2B, 0x00]);
-
-        for _ in 0..4 {
-            transport.queue_response(vec![0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00]); // ACK
-            transport.queue_response(resp.clone()); // フレーム形式のレスポンス
-        }
-
-        let chipset = Chipset::new(transport);
-        let result = chipset.initialize();
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    // Chipset::felica_polling でカード検出
-    fn chipset_felica_polling_card_detected() {
-        let transport = MockTransport::new();
-
-        transport.queue_response(vec![0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00]); // ACK
-
-        // レスポンス payload: [D7, 05, 00, TIMEOUT, LEN, 01, IDm(8), PMm(8)]
-        // IDm = [01, FE, 01, 00, 11, 22, 33, 44]
-        let payload = vec![
-            0xD7, 0x05, 0x00, 0x00, 0x12, 0x01,  // header
-            0x01, 0xFE, 0x01, 0x00, 0x11, 0x22, 0x33, 0x44,  // IDm (8 bytes)
-            0x55, 0x66, 0x77, 0x88,  // PMm (8 bytes)
-        ];
-        let frame_response = frame::encode(&payload);
-        transport.queue_response(frame_response);
-
-        let chipset = Chipset::new(transport);
-        let result = chipset.felica_polling(0xFFFF);
-        assert!(result.is_ok());
-        let idm = result.unwrap();
-        assert_eq!(idm, Some("01FE010011223344".to_string()));
-    }
-
-    #[test]
-    // Chipset::felica_polling でカード未検出
-    fn chipset_felica_polling_no_card() {
-        let transport = MockTransport::new();
-
-        transport.queue_response(vec![0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00]); // ACK
-
-        // レスポンス payload: [D7, 05, 00, TIMEOUT, 00] (len=0 = no card)
-        let payload = vec![0xD7, 0x05, 0x00, 0x00, 0x00];
-        let frame_response = frame::encode(&payload);
-        transport.queue_response(frame_response);
-
-        let chipset = Chipset::new(transport);
-        let result = chipset.felica_polling(0xFFFF);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), None);
     }
 }

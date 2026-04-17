@@ -38,10 +38,6 @@ impl MockTransport {
     pub fn queue_response(&self, data: Vec<u8>) {
         self.responses.lock().unwrap().push_back(data);
     }
-
-    pub fn sent_data(&self) -> Vec<Vec<u8>> {
-        self.sent.lock().unwrap().clone()
-    }
 }
 
 #[cfg(test)]
@@ -67,8 +63,13 @@ pub struct UsbTransport {
     handle: rusb::DeviceHandle<rusb::GlobalContext>,
 }
 
+const RC_S380_VID: u16 = 0x054C;
+const RC_S380_PID: u16 = 0x06C3;
+
 impl UsbTransport {
     /// RC-S380 を USB から検索して接続する。
+    /// nfcpy と同じシーケンス: open → set_configuration(1) → claim → ACK soft-reset
+    /// USB reset は行わない（re-enumeration 後にデバイスが invalid state になるため）
     pub fn open() -> Result<Self, TransportError> {
         let devices = rusb::devices().map_err(|e| TransportError::Usb(format!("{:?}", e)))?;
 
@@ -78,13 +79,33 @@ impl UsbTransport {
                 Err(_) => continue,
             };
 
-            if desc.vendor_id() == 0x054C && desc.product_id() == 0x06C3 {
-                let handle = device.open().map_err(|e| TransportError::Usb(format!("{:?}", e)))?;
+            if desc.vendor_id() == RC_S380_VID && desc.product_id() == RC_S380_PID {
+                let handle = device
+                    .open()
+                    .map_err(|e| TransportError::Usb(format!("{:?}", e)))?;
 
-                // カーネルドライバがアタッチされていれば detach する
+                // macOS では no-op だが Linux では必要な場合がある
                 let _ = handle.detach_kernel_driver(0);
 
-                handle.claim_interface(0).map_err(|e| TransportError::Usb(format!("{:?}", e)))?;
+                // nfcpy の set_configuration() 相当: エンドポイント状態をクリアする
+                // 既に config 1 の場合でも SET_CONFIGURATION 制御転送でエンドポイントをリセット
+                // エラーは無視（既に claim 済みの場合は BUSY が返ることがある）
+                let _ = handle.set_active_configuration(1);
+
+                handle
+                    .claim_interface(0)
+                    .map_err(|e| TransportError::Usb(format!("{:?}", e)))?;
+
+                // nfcpy 互換のソフトリセット: ACK フレームを送信してデバイスステートをクリア
+                let ack = [0x00u8, 0x00, 0xFF, 0x00, 0xFF, 0x00];
+                let _ = handle.write_bulk(0x02, &ack, Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(10));
+                // ACK への応答をドレイン
+                let mut drain_buf = vec![0u8; 256];
+                while handle
+                    .read_bulk(0x81, &mut drain_buf, Duration::from_millis(50))
+                    .is_ok()
+                {}
 
                 return Ok(UsbTransport { handle });
             }
@@ -125,6 +146,148 @@ impl Drop for UsbTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "実機テスト: RC-S380接続時に手動実行"]
+    // RC-S380 の USB インターフェース・エンドポイント構成を表示する診断テスト
+    fn hardware_usb_descriptor_dump() {
+        let devices = rusb::devices().expect("usb devices");
+        for device in devices.iter() {
+            let desc = match device.device_descriptor() {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if desc.vendor_id() != 0x054C || desc.product_id() != 0x06C3 {
+                continue;
+            }
+            println!(
+                "RC-S380 found: Bus {:03} Device {:03}",
+                device.bus_number(),
+                device.address()
+            );
+            let config = device
+                .active_config_descriptor()
+                .expect("config descriptor");
+            println!("  Configuration: {}", config.number());
+            for iface in config.interfaces() {
+                for setting in iface.descriptors() {
+                    println!(
+                        "  Interface {} (alt={}) class={:02X} subclass={:02X} proto={:02X}",
+                        setting.interface_number(),
+                        setting.setting_number(),
+                        setting.class_code(),
+                        setting.sub_class_code(),
+                        setting.protocol_code(),
+                    );
+                    for ep in setting.endpoint_descriptors() {
+                        println!(
+                            "    Endpoint 0x{:02X} dir={:?} type={:?}",
+                            ep.address(),
+                            ep.direction(),
+                            ep.transfer_type(),
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        panic!("RC-S380 not found");
+    }
+
+    fn raw_exchange(handle: &rusb::DeviceHandle<rusb::GlobalContext>, name: &str, payload: &[u8]) {
+        let cmd = super::super::frame::encode(payload);
+        println!("\n[{}] 送信: {:02X?}", name, cmd);
+        match handle.write_bulk(0x02, &cmd, Duration::from_millis(1000)) {
+            Ok(_) => {}
+            Err(e) => {
+                println!("  送信エラー: {:?}", e);
+                return;
+            }
+        }
+        for i in 1..=3 {
+            let mut buf = vec![0u8; 256];
+            match handle.read_bulk(0x81, &mut buf, Duration::from_millis(1000)) {
+                Ok(n) => {
+                    println!("  受信{} ({} bytes): {:02X?}", i, n, &buf[..n]);
+                    let decoded = super::super::frame::decode(&buf[..n]);
+                    println!("  decode: {:?}", decoded);
+                }
+                Err(e) => {
+                    println!("  受信{} エラー: {:?}", i, e);
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "実機テスト: RC-S380接続時に手動実行"]
+    // nfcpy 初期化シーケンス全体を生バイトレベルで診断する
+    fn hardware_nfcpy_init_sequence() {
+        let usb_transport = UsbTransport::open().expect("USB open");
+        let handle = &usb_transport.handle;
+
+        println!("=== ACK ソフトリセット ===");
+        let ack = [0x00u8, 0x00, 0xFF, 0x00, 0xFF, 0x00];
+        println!("ACK 送信: {:02X?}", ack);
+        let _ = handle.write_bulk(0x02, &ack, Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(10));
+        let mut drain = vec![0u8; 256];
+        while let Ok(n) = handle.read_bulk(0x81, &mut drain, Duration::from_millis(50)) {
+            println!("  ドレイン: {:02X?}", &drain[..n]);
+        }
+
+        println!("\n=== 各コマンド試行 ===");
+        // SetCommandType(1) - nfcpy 互換 3 bytes のみ
+        raw_exchange(handle, "SetCommandType(1)", &[0xD6, 0x2A, 0x01]);
+        // GetFirmwareVersion
+        raw_exchange(handle, "GetFirmwareVersion", &[0xD6, 0x20]);
+        // SwitchRF(off)
+        raw_exchange(handle, "SwitchRF(off)", &[0xD6, 0x06, 0x00]);
+    }
+
+    #[test]
+    #[ignore = "実機テスト: RC-S380接続時に手動実行"]
+    // GetFirmwareVersion の生バイト送受信を確認する診断テスト（複数受信付き）
+    fn hardware_raw_get_firmware_version() {
+        let transport = UsbTransport::open().expect("USB open");
+
+        // コマンド送信前にドレイン（前のセッションの残留データを除去）
+        {
+            let handle = &transport.handle;
+            let mut drain = vec![0u8; 256];
+            let mut drain_count = 0;
+            while let Ok(n) = handle.read_bulk(0x81, &mut drain, Duration::from_millis(100)) {
+                println!("ドレイン: {} bytes: {:02X?}", n, &drain[..n]);
+                drain_count += 1;
+                if drain_count > 10 {
+                    break;
+                }
+            }
+            println!("ドレイン完了 ({} packets)", drain_count);
+        }
+
+        // GetFirmwareVersion: [D6, 20] を拡張フレームで送信
+        let cmd = super::super::frame::encode(&[0xD6, 0x20]);
+        println!("送信: {:02X?}", cmd);
+        transport.send(&cmd).expect("send");
+
+        // 最大5回受信して全パケットを表示
+        for i in 1..=5 {
+            let mut buf = vec![0u8; 256];
+            match transport.recv(&mut buf, 1000) {
+                Ok(n) => {
+                    println!("受信{} ({} bytes): {:02X?}", i, n, &buf[..n]);
+                    let frame = super::super::frame::decode(&buf[..n]);
+                    println!("  decode: {:?}", frame);
+                }
+                Err(e) => {
+                    println!("受信{} エラー: {:?}", i, e);
+                    break;
+                }
+            }
+        }
+    }
 
     #[test]
     #[ignore = "実機テスト: RC-S380接続時に手動実行"]
@@ -181,11 +344,12 @@ mod tests {
         println!("  完全hex: {:02X?}", all_data);
 
         match super::super::frame::decode(&all_data) {
-            Ok(Some(payload)) => {
+            Ok(super::super::frame::DecodedFrame::Data(payload)) => {
                 println!("  ✓ デコード成功");
                 println!("    payload: {:02X?}", payload);
             }
-            Ok(None) => println!("  (ACK frame)"),
+            Ok(super::super::frame::DecodedFrame::Ack) => println!("  (ACK frame)"),
+            Ok(super::super::frame::DecodedFrame::Error) => println!("  (Error frame)"),
             Err(e) => println!("  ✗ デコードエラー: {:?}", e),
         }
     }

@@ -1,5 +1,5 @@
-mod reader;
 mod rcs380;
+mod reader;
 
 use anyhow::Result;
 
