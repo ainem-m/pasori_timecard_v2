@@ -45,24 +45,28 @@ impl<T: Transport> Chipset<T> {
     /// チップセット初期化 (nfcpy Chipset.__init__ + sense_ttf 互換)
     pub fn initialize(&self) -> Result<(), ChipsetError> {
         // Step 1: SetCommandType(1) — Port-100 拡張コマンドモードを有効化
+        tracing::debug!("Step 1: SetCommandType(1)");
         self.send_command_and_recv(&[0xD6, 0x2A, 0x01])?;
-
+ 
         // Step 2: GetFirmwareVersion
+        tracing::debug!("Step 2: GetFirmwareVersion");
         let ver = self.get_firmware_version()?;
         tracing::info!(fw = %ver, "RC-S380 firmware version");
-
+ 
         // Step 3: GetPDDataVersion (nfcpy Chipset.__init__ で必須)
+        tracing::debug!("Step 3: GetPDDataVersion");
         self.send_command_and_recv(&[0xD6, 0x22])?;
-
+ 
         // Step 4: SwitchRF off
+        tracing::debug!("Step 4: SwitchRF off");
         self.send_command_and_recv(&[0xD6, 0x06, 0x00])?;
-
+ 
         // Step 5: InSetRF (212F: send_set=1, comm_type=0x01, recv_set=0x0F, recv_comm_type=0x01)
+        tracing::debug!("Step 5: InSetRF");
         self.send_command_and_recv(&[0xD6, 0x00, 0x01, 0x01, 0x0F, 0x01])?;
-
+ 
         // Step 6: InSetProtocol (nfcpy in_set_protocol_defaults — tag-value ペア, END マーカーなし)
-        // nfcpy: bytearray.fromhex("0018 0101 0201 0300 0400 0500 0600 0708 0800 0900
-        //                           0A00 0B00 0C00 0E04 0F00 1000 1100 1200 1306")
+        tracing::debug!("Step 6: InSetProtocol");
         #[rustfmt::skip]
         let defaults_payload = [
             0x00u8, 0x18,  // INITIAL_GUARD_TIME = 24 (0x18)
@@ -79,7 +83,6 @@ impl<T: Transport> Chipset<T> {
             0x0B, 0x00,    // ADD_EOF = 0
             0x0C, 0x00,    // CHECK_EOF = 0
             0x0E, 0x04,    // DEAF_TIME = 4
-            0x0F, 0x00,    // CRM = 0
             0x10, 0x00,    // CRM_MIN_LEN = 0
             0x11, 0x00,    // T1_TAG_RRDD = 0
             0x12, 0x00,    // RFCA = 0
@@ -88,7 +91,7 @@ impl<T: Transport> Chipset<T> {
         let mut protocol_cmd = vec![0xD6u8, 0x02];
         protocol_cmd.extend_from_slice(&defaults_payload);
         self.send_command_and_recv(&protocol_cmd)?;
-
+ 
         Ok(())
     }
 
@@ -180,13 +183,16 @@ impl<T: Transport> Chipset<T> {
     /// コマンドを送信し、ACK と レスポンスを受信する。
     fn send_command_and_recv(&self, cmd: &[u8]) -> Result<Vec<u8>, ChipsetError> {
         let frame = frame::encode(cmd);
+        tracing::trace!(cmd = ?cmd, "sending USB frame");
         self.transport.send(&frame)?;
-
-        let mut ack_buf = vec![0u8; 256];
+ 
+        tracing::trace!("waiting for ACK...");
+        let mut ack_buf = [0u8; 512];
         let ack_size = self.transport.recv(&mut ack_buf, 1000)?;
-
+ 
         let is_ack = ack_size == 6 && ack_buf[..6] == [0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00];
         if !is_ack {
+            tracing::debug!(size = ack_size, hex = ?&ack_buf[..ack_size], "received non-ACK instead of ACK");
             // 6バイトACKではなかった場合、これ自体がレスポンスの可能性もある
             let data = ack_buf[..ack_size].to_vec();
             return match frame::decode(&data)? {
@@ -200,12 +206,15 @@ impl<T: Transport> Chipset<T> {
                 }
             };
         }
-
-        let mut resp_buf = vec![0u8; 256];
+        tracing::trace!("ACK received");
+ 
+        tracing::trace!("waiting for response data...");
+        let mut resp_buf = [0u8; 512];
         let resp_size = self.transport.recv(&mut resp_buf, 2500)?;
-        resp_buf.truncate(resp_size);
-
-        match frame::decode(&resp_buf)? {
+        let data = resp_buf[..resp_size].to_vec();
+        tracing::trace!(size = resp_size, "response data received");
+ 
+        match frame::decode(&data)? {
             DecodedFrame::Data(p) => Ok(p),
             DecodedFrame::Ack => Err(ChipsetError::Protocol(
                 "expected data frame, got ACK".to_string(),

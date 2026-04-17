@@ -15,13 +15,15 @@ async fn main() -> Result<()> {
     tracing::info!("server workspace status = {}", WORKSPACE_STATUS);
 
     let database_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:pasori_timecard.db".to_string());
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:pasori_timecard.db?mode=rwc".to_string());
 
+    tracing::info!(database_url, "connecting to database...");
+    
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect(&database_url)
         .await
-        .context("failed to connect to SQLite")?;
+        .with_context(|| format!("failed to connect to SQLite at {}", database_url))?;
 
     sqlx::migrate!("../../migrations")
         .run(&pool)
@@ -30,13 +32,20 @@ async fn main() -> Result<()> {
 
     let repo = Arc::new(SqliteRepository::new(pool));
 
-    let bot_id = std::env::var("LINEWORKS_BOT_ID").context("LINEWORKS_BOT_ID is required")?;
-    let bot_secret =
-        std::env::var("LINEWORKS_BOT_SECRET").context("LINEWORKS_BOT_SECRET is required")?;
-    let bot_token =
-        std::env::var("LINEWORKS_API_TOKEN").context("LINEWORKS_API_TOKEN is required")?;
+    let notifier: Arc<dyn pasori_core::port::notify::Notifier> =
+        match (std::env::var("LINEWORKS_BOT_ID"), std::env::var("LINEWORKS_API_TOKEN")) {
+            (Ok(bot_id), Ok(bot_token)) => {
+                tracing::info!("LINE WORKS notifier initialized");
+                Arc::new(LineworksNotifier::new(bot_id, bot_token))
+            }
+            _ => {
+                tracing::warn!("LINE WORKS credentials missing, falling back to ConsoleNotifier");
+                Arc::new(server::infra::console_notify::ConsoleNotifier)
+            }
+        };
 
-    let notifier = Arc::new(LineworksNotifier::new(bot_id, bot_token));
+    let bot_secret = std::env::var("LINEWORKS_BOT_SECRET").unwrap_or_else(|_| "dummy_secret".to_string());
+
     let punch_policy = Arc::new(DefaultPunchPolicy);
 
     let punch_use_case = Arc::new(PunchUseCase::new(
@@ -56,10 +65,14 @@ async fn main() -> Result<()> {
         notifier.clone(),
     ));
 
-    // Combine use cases as needed.
-    let app = lineworks::router(bot_secret.into_bytes(), lineworks_use_case)
+    let api_router = axum::Router::new()
+        .merge(lineworks::router(bot_secret.into_bytes(), lineworks_use_case))
         .merge(server::terminal::router(punch_use_case))
-        .merge(server::admin::router(repo.clone()));
+        .merge(server::admin::router(repo.clone(), repo.clone(), repo.clone()));
+
+    let app = axum::Router::new()
+        .nest("/api", api_router)
+        .fallback(server::web_assets::static_handler);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
         .await

@@ -20,9 +20,10 @@ pub struct TerminalAppState {
 
 pub fn router(punch_use_case: Arc<PunchUseCase>) -> Router {
     Router::new()
-        .route("/api/health", get(health_check))
-        .route("/api/terminals/me/card_scanned", get(card_scanned))
-        .route("/api/punches", post(submit_punch))
+        .route("/health", get(health_check))
+        .route("/terminals/me/card_scanned", get(card_scanned))
+        .route("/terminals/me/punches", post(sync_punch))
+        .route("/punches", post(submit_punch))
         .with_state(TerminalAppState { punch_use_case })
 }
 
@@ -67,6 +68,7 @@ async fn card_scanned(
                 employee,
                 recent_events,
                 suggested_type,
+                ..
             } = *scan;
             Ok(Json(CardScannedResponse::Registered(Box::new(
                 RegisteredCardScanResponse {
@@ -111,5 +113,40 @@ async fn submit_punch(
     match state.punch_use_case.submit_punch(event).await {
         Ok(punch) => Ok((StatusCode::CREATED, Json(punch))),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct TerminalSubmitPunchRequest {
+    pub punch_id: uuid::Uuid,
+    pub card_id: String,
+    pub event_type: PunchEventType,
+    pub occurred_at: jiff::Zoned,
+}
+
+async fn sync_punch(
+    State(state): State<TerminalAppState>,
+    Json(payload): Json<TerminalSubmitPunchRequest>,
+) -> impl IntoResponse {
+    let now = jiff::Zoned::now();
+    let card_id = CardId(payload.card_id);
+
+    // Resolve card first
+    match state.punch_use_case.resolve_card_scan(&card_id, &now).await {
+        Ok(ResolvedCardScan::Registered(scan)) => {
+            let event = NewPunchEvent {
+                id: payload.punch_id,
+                employee_id: scan.employee.id,
+                card_id: scan.card_id, 
+                event_type: payload.event_type,
+                occurred_at: payload.occurred_at,
+                source: "terminal".to_string(),
+            };
+            match state.punch_use_case.submit_punch(event).await {
+                Ok(punch) => Ok((StatusCode::CREATED, Json(punch))),
+                Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+            }
+        }
+        _ => Err(StatusCode::NOT_FOUND),
     }
 }

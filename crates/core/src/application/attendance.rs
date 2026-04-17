@@ -82,6 +82,7 @@ impl PunchUseCase {
             employee,
             recent_events,
             suggested_type,
+            card_id: Some(card.id),
         })))
     }
 
@@ -123,6 +124,7 @@ pub struct RegisteredCardScan {
     pub employee: Employee,
     pub recent_events: Vec<PunchEvent>,
     pub suggested_type: PunchEventType,
+    pub card_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

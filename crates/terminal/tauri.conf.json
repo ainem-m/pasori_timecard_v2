@@ -1,0 +1,28 @@
+{
+  "productName": "PasoriTimecard",
+  "version": "0.1.0",
+  "identifier": "com.ainem.pasori-timecard",
+  "build": {
+    "beforeDevCommand": "corepack pnpm terminal:dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "corepack pnpm terminal:build",
+    "frontendDist": "../../web/terminal/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Pasori Timecard Terminal",
+        "fullscreen": true,
+        "resizable": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": []
+  }
+}

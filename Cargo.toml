@@ -31,3 +31,6 @@ tower = "0.5"
 pcsc = "2"
 uuid = { version = "1", features = ["v7", "serde"] }
 rusb = "0.9"
+tauri = "2"
+tauri-build = "2"
+tauri-specta = "2.0.0-rc.20"

@@ -37,7 +37,7 @@ impl LineworksAppState {
 
 pub fn router(bot_secret: impl Into<Arc<[u8]>>, use_case: Arc<LineworksUseCase>) -> Router {
     Router::new()
-        .route("/api/lineworks/callback", post(callback))
+        .route("/lineworks/callback", post(callback))
         .with_state(LineworksAppState::new(bot_secret, use_case))
 }
 
@@ -380,7 +380,7 @@ mod tests {
 
         let request: Request<Body> = Request::builder()
             .method("POST")
-            .uri("/api/lineworks/callback")
+            .uri("/lineworks/callback")
             .header("X-WORKS-Signature", signature)
             .body(Body::from(body))
             .expect("request should be built");
@@ -408,7 +408,7 @@ mod tests {
 
         let request: Request<Body> = Request::builder()
             .method("POST")
-            .uri("/api/lineworks/callback")
+            .uri("/lineworks/callback")
             .body(Body::from(body))
             .expect("request should be built");
 
@@ -436,7 +436,7 @@ mod tests {
 
         let request: Request<Body> = Request::builder()
             .method("POST")
-            .uri("/api/lineworks/callback")
+            .uri("/lineworks/callback")
             .header("X-WORKS-Signature", signature)
             .body(Body::from(body))
             .expect("request should be built");
@@ -539,7 +539,7 @@ mod tests {
 
         let request: Request<Body> = Request::builder()
             .method("POST")
-            .uri("/api/lineworks/callback")
+            .uri("/lineworks/callback")
             .header("X-WORKS-Signature", signature)
             .body(Body::from(body.as_slice()))
             .expect("request should be built");

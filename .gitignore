@@ -5,3 +5,7 @@
 /dist
 /.DS_Store
 /.pnpm-store
+*.db
+*.db-shm
+*.db-wal
+package-lock.json

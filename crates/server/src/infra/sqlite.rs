@@ -578,9 +578,9 @@ fn map_employee_row(row: sqlx::sqlite::SqliteRow) -> Result<Employee, RepoError>
         id: Uuid::parse_str(row.get("id")).map_err(|e| RepoError::Db(e.to_string()))?,
         display_name: row.get("display_name"),
         employment_type: row.get("employment_type"),
-        affiliation: row.get("affiliation"),
+        affiliation: row.get::<Option<String>, _>("affiliation"),
         is_active: row.get::<i32, _>("is_active") != 0,
-        note: row.get("note"),
+        note: row.get::<Option<String>, _>("note"),
         created_at: parse_zoned(row.get("created_at"))?,
         updated_at: parse_zoned(row.get("updated_at"))?,
     })
