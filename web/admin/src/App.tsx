@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { type FormEvent, useEffect, useState } from 'react';
 import { 
   Users, 
   Clock, 
@@ -49,6 +49,11 @@ interface AuditLog {
   created_at: string;
 }
 
+interface LoginFormState {
+  username: string;
+  password: string;
+}
+
 // --- Components ---
 
 const SidebarItem = ({ icon: Icon, label, active, onClick }: { icon: LucideIcon, label: string, active?: boolean, onClick: () => void }) => (
@@ -87,30 +92,124 @@ export default function App() {
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [punches, setPunches] = useState<PunchEvent[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
-  const [, setLoading] = useState(true);
+  const [isLoading, setLoading] = useState(true);
+  const [needsLogin, setNeedsLogin] = useState(false);
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [loginForm, setLoginForm] = useState<LoginFormState>({ username: '', password: '' });
 
-  // Fetch data
-  useEffect(() => {
-    async function fetchData() {
-      setLoading(true);
-      try {
-        const [empRes, punchRes, auditRes] = await Promise.all([
-          fetch('/api/admin/employees'),
-          fetch('/api/admin/punches'),
-          fetch('/api/admin/audit_logs')
-        ]);
-        
-        if (empRes.ok) setEmployees(await empRes.json());
-        if (punchRes.ok) setPunches(await punchRes.json());
-        if (auditRes.ok) setAuditLogs(await auditRes.json());
-      } catch (err) {
-        console.error('Failed to fetch data', err);
-      } finally {
-        setLoading(false);
+  async function fetchData() {
+    setLoading(true);
+    try {
+      const [empRes, punchRes, auditRes] = await Promise.all([
+        fetch('/api/admin/employees', { credentials: 'same-origin' }),
+        fetch('/api/admin/punches', { credentials: 'same-origin' }),
+        fetch('/api/admin/audit_logs', { credentials: 'same-origin' })
+      ]);
+
+      const responses = [empRes, punchRes, auditRes];
+      if (responses.some((response) => response.status === 401)) {
+        setNeedsLogin(true);
+        return;
       }
+
+      if (empRes.ok) setEmployees(await empRes.json());
+      if (punchRes.ok) setPunches(await punchRes.json());
+      if (auditRes.ok) setAuditLogs(await auditRes.json());
+      setNeedsLogin(false);
+      setLoginError(null);
+    } catch (err) {
+      console.error('Failed to fetch data', err);
+    } finally {
+      setLoading(false);
     }
+  }
+
+  useEffect(() => {
     fetchData();
   }, [view]);
+
+  async function handleLoginSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setLoginError(null);
+    setLoading(true);
+
+    try {
+      const response = await fetch('/api/admin/login', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(loginForm),
+      });
+
+      if (response.status === 401) {
+        setLoginError('ユーザー名またはパスワードが正しくありません。');
+        return;
+      }
+
+      if (!response.ok) {
+        setLoginError('ログインに失敗しました。時間をおいて再試行してください。');
+        return;
+      }
+
+      setNeedsLogin(false);
+      setLoginForm({ username: '', password: '' });
+      await fetchData();
+    } catch (err) {
+      console.error('Failed to login', err);
+      setLoginError('ログインに失敗しました。時間をおいて再試行してください。');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  if (needsLogin) {
+    return (
+      <div className="min-h-screen bg-background text-foreground flex items-center justify-center p-6">
+        <div className="w-full max-w-md card p-8 space-y-6">
+          <div className="space-y-2 text-center">
+            <h1 className="text-3xl font-bold tracking-tight">Admin Login</h1>
+            <p className="text-sm text-muted-foreground">管理画面を利用するにはログインが必要です。</p>
+          </div>
+
+          <form className="space-y-4" onSubmit={handleLoginSubmit}>
+            <label className="block space-y-2">
+              <span className="text-sm font-medium">Username</span>
+              <input
+                className="w-full rounded-lg border border-border bg-background px-3 py-2"
+                value={loginForm.username}
+                onChange={(event) => setLoginForm((current) => ({ ...current, username: event.target.value }))}
+                autoComplete="username"
+              />
+            </label>
+            <label className="block space-y-2">
+              <span className="text-sm font-medium">Password</span>
+              <input
+                type="password"
+                className="w-full rounded-lg border border-border bg-background px-3 py-2"
+                value={loginForm.password}
+                onChange={(event) => setLoginForm((current) => ({ ...current, password: event.target.value }))}
+                autoComplete="current-password"
+              />
+            </label>
+
+            {loginError && (
+              <p className="text-sm text-red-500">{loginError}</p>
+            )}
+
+            <button
+              type="submit"
+              className="w-full rounded-lg bg-brand text-brand-foreground py-2 font-medium disabled:opacity-60"
+              disabled={isLoading}
+            >
+              {isLoading ? 'Signing in...' : 'Sign in'}
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen flex bg-background">

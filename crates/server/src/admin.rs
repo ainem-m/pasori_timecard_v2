@@ -2,10 +2,11 @@ use crate::infra::sqlite::{AuthenticatedAdmin, SqliteRepository};
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
+use pasori_core::domain::audit::NewAuditLog;
 use pasori_core::domain::employee::{EmployeePatch, NewEmployee};
 use pasori_core::port::repo::{AuditLogRepository, EmployeeRepository};
 use std::sync::Arc;
@@ -18,6 +19,7 @@ pub struct AdminAppState {
 
 pub fn router(repo: Arc<SqliteRepository>) -> Router {
     Router::new()
+        .route("/admin/login", post(login))
         .route(
             "/admin/employees",
             get(list_employees).post(create_employee),
@@ -31,6 +33,90 @@ pub fn router(repo: Arc<SqliteRepository>) -> Router {
         .route("/admin/punches", get(list_punches))
         .route("/admin/audit_logs", get(list_audit_logs))
         .with_state(AdminAppState { repo })
+}
+
+#[derive(serde::Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(serde::Serialize)]
+struct LoginResponse {
+    display_name: String,
+}
+
+async fn login(
+    State(state): State<AdminAppState>,
+    Json(payload): Json<LoginRequest>,
+) -> impl IntoResponse {
+    match state
+        .repo
+        .verify_admin_credentials(&payload.username, &payload.password)
+        .await
+    {
+        Ok(Some(admin)) => {
+            let (session_id, expires_at) = match state.repo.create_admin_session(admin.id).await {
+                Ok(session) => session,
+                Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+            };
+
+            let _ = state
+                .repo
+                .append(NewAuditLog {
+                    actor_type: "admin".to_string(),
+                    actor_id: Some(admin.id.to_string()),
+                    action: "admin.login_success".to_string(),
+                    target_type: "admin_user".to_string(),
+                    target_id: Some(admin.id.to_string()),
+                    before_json: None,
+                    after_json: None,
+                    metadata_json: Some(
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "expires_at": expires_at.to_string(),
+                        })
+                        .to_string(),
+                    ),
+                })
+                .await;
+
+            let cookie = match build_admin_session_cookie(&session_id) {
+                Ok(cookie) => cookie,
+                Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+            };
+
+            Ok((
+                [(header::SET_COOKIE, cookie)],
+                Json(LoginResponse {
+                    display_name: admin.display_name,
+                }),
+            ))
+        }
+        Ok(None) => {
+            let _ = state
+                .repo
+                .append(NewAuditLog {
+                    actor_type: "system".to_string(),
+                    actor_id: None,
+                    action: "admin.login_failure".to_string(),
+                    target_type: "admin_user".to_string(),
+                    target_id: None,
+                    before_json: None,
+                    after_json: None,
+                    metadata_json: Some(
+                        serde_json::json!({
+                            "username": payload.username,
+                        })
+                        .to_string(),
+                    ),
+                })
+                .await;
+
+            Err(StatusCode::UNAUTHORIZED)
+        }
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 async fn list_employees(
@@ -189,14 +275,33 @@ fn extract_admin_session_cookie(headers: &HeaderMap) -> Option<&str> {
     })
 }
 
+fn build_admin_session_cookie(
+    session_id: &Uuid,
+) -> Result<HeaderValue, axum::http::header::InvalidHeaderValue> {
+    let secure = if cfg!(debug_assertions) {
+        ""
+    } else {
+        "; Secure"
+    };
+    HeaderValue::from_str(&format!(
+        "admin_session={}; Path=/; HttpOnly; SameSite=Strict{}; Max-Age=86400",
+        session_id, secure
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::router;
     use crate::infra::sqlite::SqliteRepository;
+    use argon2::{
+        Argon2,
+        password_hash::{PasswordHasher, SaltString},
+    };
     use axum::{body::Body, http::Request, http::StatusCode};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     #[tokio::test]
     // Admin API は session cookie なしでは利用できない。
@@ -216,6 +321,38 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    #[tokio::test]
+    // 正しい資格情報でログインすると session cookie を返す。
+    async fn logs_in_and_sets_admin_session_cookie() {
+        let app = test_app().await;
+        let body = serde_json::json!({
+            "username": "admin",
+            "password": "correct horse battery staple",
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/login")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .expect("set-cookie header");
+        assert!(cookie.contains("admin_session="));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+    }
+
     async fn test_app() -> axum::Router {
         let database_url = format!(
             "sqlite:file:{}?mode=memory&cache=shared",
@@ -232,6 +369,31 @@ mod tests {
             .await
             .expect("migrate");
 
+        let now = "2026-04-20T00:00:00+09:00[Asia/Tokyo]";
+        let admin_hash = hash_password("correct horse battery staple");
+        sqlx::query(
+            "INSERT INTO admin_user (id, username, password_hash, display_name, is_active, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 1, ?, ?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind("admin")
+        .bind(admin_hash)
+        .bind("管理者")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert admin user");
+
         router(Arc::new(SqliteRepository::new(pool)))
+    }
+
+    fn hash_password(password: &str) -> String {
+        let salt =
+            SaltString::from_b64("dGVzdF9hZG1pbl9zYWx0").expect("static salt should be valid");
+        Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .expect("hash password")
+            .to_string()
     }
 }

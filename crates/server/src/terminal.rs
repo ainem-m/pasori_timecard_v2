@@ -11,6 +11,7 @@ use pasori_core::application::attendance::{PunchUseCase, ResolvedCardScan};
 use pasori_core::domain::punch::{NewPunchEvent, PunchEvent};
 use pasori_core::port::policy::PunchEventType;
 use pasori_core::port::reader::CardId;
+use pasori_core::port::repo::RepoError;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -127,7 +128,7 @@ async fn submit_punch(
 
     match state.punch_use_case.submit_punch(event).await {
         Ok(punch) => Ok((StatusCode::CREATED, Json(punch))),
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => handle_submit_error(&state, payload.punch_id, error).await,
     }
 }
 
@@ -165,11 +166,30 @@ async fn sync_punch(
             };
             match state.punch_use_case.submit_punch(event).await {
                 Ok(punch) => Ok((StatusCode::CREATED, Json(punch))),
-                Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+                Err(error) => handle_submit_error(&state, payload.punch_id, error).await,
             }
         }
         _ => Err(StatusCode::NOT_FOUND),
     }
+}
+
+async fn handle_submit_error(
+    state: &TerminalAppState,
+    punch_id: uuid::Uuid,
+    error: anyhow::Error,
+) -> Result<(StatusCode, Json<PunchEvent>), StatusCode> {
+    if let Some(RepoError::Conflict(_)) = error.downcast_ref::<RepoError>() {
+        let existing = state
+            .repo
+            .find_punch_by_id(punch_id)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        return Ok((StatusCode::OK, Json(existing)));
+    }
+
+    Err(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn authenticate_terminal_request(
@@ -272,6 +292,57 @@ mod tests {
             .expect("stored punch");
 
         assert_eq!(row.get::<String, _>("source"), "local_cached");
+    }
+
+    #[tokio::test]
+    // 同じ打刻を再送しても既存レコードを返して同期完了できる。
+    async fn accepts_duplicate_replay_for_existing_punch() {
+        let (app, pool) = test_app("terminal-secret").await;
+        let punch_id = Uuid::now_v7();
+        let body = serde_json::json!({
+            "punch_id": punch_id,
+            "card_id": TEST_CARD_ID,
+            "event_type": "clock_in",
+            "occurred_at": "2026-04-17T09:00:00+09:00[Asia/Tokyo]",
+            "source": "local_cached"
+        })
+        .to_string();
+
+        let first_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/terminals/me/punches")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer terminal-secret")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(first_response.status(), StatusCode::CREATED);
+
+        let second_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/terminals/me/punches")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer terminal-secret")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(second_response.status(), StatusCode::OK);
+
+        let row = sqlx::query("SELECT COUNT(*) as count FROM punch_event WHERE id = ?")
+            .bind(punch_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("punch count");
+        assert_eq!(row.get::<i64, _>("count"), 1);
     }
 
     async fn test_pool() -> sqlx::SqlitePool {
