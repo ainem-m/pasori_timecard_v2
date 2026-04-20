@@ -148,6 +148,11 @@ export default function App() {
         return;
       }
 
+      if (response.status === 423) {
+        setLoginError('ログイン失敗が続いたため、15分後に再試行してください。');
+        return;
+      }
+
       if (!response.ok) {
         setLoginError('ログインに失敗しました。時間をおいて再試行してください。');
         return;
@@ -160,6 +165,25 @@ export default function App() {
       console.error('Failed to login', err);
       setLoginError('ログインに失敗しました。時間をおいて再試行してください。');
     } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleLogout() {
+    setLoading(true);
+    try {
+      await fetch('/api/admin/logout', {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+    } catch (err) {
+      console.error('Failed to logout', err);
+    } finally {
+      setEmployees([]);
+      setPunches([]);
+      setAuditLogs([]);
+      setNeedsLogin(true);
+      setLoginError(null);
       setLoading(false);
     }
   }
@@ -254,6 +278,13 @@ export default function App() {
             <button className="p-2 rounded-full hover:bg-accent relative transition-colors">
               <Bell className="w-5 h-5" />
               <span className="absolute top-2 right-2 w-2 h-2 bg-brand rounded-full border-2 border-background"></span>
+            </button>
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="rounded-full border border-border px-4 py-2 text-sm font-medium transition-colors hover:bg-accent"
+            >
+              Logout
             </button>
             <div className="w-8 h-8 rounded-full bg-accent border border-border"></div>
           </div>

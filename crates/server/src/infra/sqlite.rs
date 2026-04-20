@@ -40,6 +40,13 @@ pub struct AdminUserRecord {
     pub display_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminAuthenticationResult {
+    Authenticated(AdminUserRecord),
+    InvalidCredentials,
+    Locked { locked_until: Zoned },
+}
+
 impl SqliteRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -143,11 +150,12 @@ impl SqliteRepository {
             sqlx::query(
                 r#"
                 UPDATE admin_session
-                SET expires_at = ?
+                SET expires_at = ?, last_active_at = ?
                 WHERE id = ?
                 "#,
             )
             .bind(next_expiry.to_string())
+            .bind(now.to_string())
             .bind(session_id)
             .execute(&self.pool)
             .await
@@ -188,10 +196,11 @@ impl SqliteRepository {
         &self,
         username: &str,
         password: &str,
-    ) -> Result<Option<AdminUserRecord>, RepoError> {
+    ) -> Result<AdminAuthenticationResult, RepoError> {
+        let now = Zoned::now();
         let row = sqlx::query(
             r#"
-            SELECT id, display_name, password_hash
+            SELECT id, display_name, password_hash, failed_login_attempts, locked_until
             FROM admin_user
             WHERE username = ? AND is_active = 1
             "#,
@@ -202,8 +211,41 @@ impl SqliteRepository {
         .map_err(to_repo_error)?;
 
         let Some(row) = row else {
-            return Ok(None);
+            return Ok(AdminAuthenticationResult::InvalidCredentials);
         };
+
+        let admin_id = Uuid::parse_str(&row.try_get::<String, _>("id").map_err(to_repo_error)?)
+            .map_err(|e| RepoError::Db(e.to_string()))?;
+        let display_name = row
+            .try_get::<String, _>("display_name")
+            .map_err(to_repo_error)?;
+        let failed_login_attempts = row
+            .try_get::<i64, _>("failed_login_attempts")
+            .map_err(to_repo_error)?;
+        let locked_until = row
+            .try_get::<Option<String>, _>("locked_until")
+            .map_err(to_repo_error)?
+            .map(|value| parse_zoned(&value))
+            .transpose()?;
+
+        if let Some(locked_until) = locked_until {
+            if locked_until > now {
+                return Ok(AdminAuthenticationResult::Locked { locked_until });
+            }
+
+            sqlx::query(
+                r#"
+                UPDATE admin_user
+                SET failed_login_attempts = 0, locked_until = NULL, updated_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(now.to_string())
+            .bind(admin_id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(to_repo_error)?;
+        }
 
         let password_hash = row
             .try_get::<String, _>("password_hash")
@@ -215,15 +257,50 @@ impl SqliteRepository {
             .verify_password(password.as_bytes(), &parsed_hash)
             .is_err()
         {
-            return Ok(None);
+            let next_failed_attempts = failed_login_attempts + 1;
+            let locked_until = if next_failed_attempts >= 5 {
+                Some(admin_lockout_until(&now)?)
+            } else {
+                None
+            };
+
+            sqlx::query(
+                r#"
+                UPDATE admin_user
+                SET failed_login_attempts = ?, locked_until = ?, updated_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(next_failed_attempts)
+            .bind(locked_until.as_ref().map(ToString::to_string))
+            .bind(now.to_string())
+            .bind(admin_id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(to_repo_error)?;
+
+            return Ok(match locked_until {
+                Some(locked_until) => AdminAuthenticationResult::Locked { locked_until },
+                None => AdminAuthenticationResult::InvalidCredentials,
+            });
         }
 
-        Ok(Some(AdminUserRecord {
-            id: Uuid::parse_str(&row.try_get::<String, _>("id").map_err(to_repo_error)?)
-                .map_err(|e| RepoError::Db(e.to_string()))?,
-            display_name: row
-                .try_get::<String, _>("display_name")
-                .map_err(to_repo_error)?,
+        sqlx::query(
+            r#"
+            UPDATE admin_user
+            SET failed_login_attempts = 0, locked_until = NULL, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.to_string())
+        .bind(admin_id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(to_repo_error)?;
+
+        Ok(AdminAuthenticationResult::Authenticated(AdminUserRecord {
+            id: admin_id,
+            display_name,
         }))
     }
 
@@ -237,19 +314,57 @@ impl SqliteRepository {
 
         sqlx::query(
             r#"
-            INSERT INTO admin_session (id, admin_user_id, expires_at, created_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO admin_session (id, admin_user_id, expires_at, created_at, last_active_at)
+            VALUES (?, ?, ?, ?, ?)
             "#,
         )
         .bind(session_id.to_string())
         .bind(admin_user_id.to_string())
         .bind(expires_at.to_string())
         .bind(now.to_string())
+        .bind(now.to_string())
         .execute(&self.pool)
         .await
         .map_err(to_repo_error)?;
 
         Ok((session_id, expires_at))
+    }
+
+    pub async fn delete_admin_session(&self, session_id: &str) -> Result<Option<Uuid>, RepoError> {
+        let row = sqlx::query(
+            r#"
+            SELECT admin_user_id
+            FROM admin_session
+            WHERE id = ?
+            "#,
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(to_repo_error)?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let admin_user_id = Uuid::parse_str(
+            &row.try_get::<String, _>("admin_user_id")
+                .map_err(to_repo_error)?,
+        )
+        .map_err(|e| RepoError::Db(e.to_string()))?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM admin_session
+            WHERE id = ?
+            "#,
+        )
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .map_err(to_repo_error)?;
+
+        Ok(Some(admin_user_id))
     }
 }
 
@@ -995,6 +1110,12 @@ fn session_expiry_from(now: &Zoned) -> Result<Zoned, RepoError> {
         .map_err(|e| RepoError::Db(e.to_string()))
 }
 
+fn admin_lockout_until(now: &Zoned) -> Result<Zoned, RepoError> {
+    now.clone()
+        .checked_add(jiff::SignedDuration::from_mins(15))
+        .map_err(|e| RepoError::Db(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1179,6 +1300,7 @@ mod tests {
     }
 
     #[tokio::test]
+    // 正しい資格情報では管理者を返し、失敗回数をリセットする。
     async fn verifies_admin_credentials() {
         let pool = setup_db().await;
         let repo = SqliteRepository::new(pool.clone());
@@ -1206,7 +1328,7 @@ mod tests {
             .expect("verify");
         assert_eq!(
             admin,
-            Some(AdminUserRecord {
+            AdminAuthenticationResult::Authenticated(AdminUserRecord {
                 id: admin_id,
                 display_name: "管理者".to_string(),
             })
@@ -1214,6 +1336,45 @@ mod tests {
     }
 
     #[tokio::test]
+    // 5 回連続失敗した管理者は 15 分ロックされる。
+    async fn locks_admin_after_five_failed_logins() {
+        let pool = setup_db().await;
+        let repo = SqliteRepository::new(pool.clone());
+        let admin_id = Uuid::now_v7();
+        let now = Zoned::now();
+        let password_hash = hash_password("correct-password");
+
+        sqlx::query(
+            "INSERT INTO admin_user (id, username, password_hash, display_name, is_active, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 1, ?, ?)",
+        )
+        .bind(admin_id.to_string())
+        .bind("admin")
+        .bind(password_hash)
+        .bind("管理者")
+        .bind(now.to_string())
+        .bind(now.to_string())
+        .execute(&pool)
+        .await
+        .expect("insert admin");
+
+        for _ in 0..4 {
+            let result = repo
+                .verify_admin_credentials("admin", "wrong-password")
+                .await
+                .expect("verify");
+            assert_eq!(result, AdminAuthenticationResult::InvalidCredentials);
+        }
+
+        let result = repo
+            .verify_admin_credentials("admin", "wrong-password")
+            .await
+            .expect("verify");
+        assert!(matches!(result, AdminAuthenticationResult::Locked { .. }));
+    }
+
+    #[tokio::test]
+    // session 利用時は期限だけでなく最終活動時刻も更新する。
     async fn extends_admin_session_on_authentication() {
         let pool = setup_db().await;
         let repo = SqliteRepository::new(pool.clone());
@@ -1240,12 +1401,13 @@ mod tests {
         .expect("insert admin");
 
         sqlx::query(
-            "INSERT INTO admin_session (id, admin_user_id, expires_at, created_at)
-             VALUES (?, ?, ?, ?)",
+            "INSERT INTO admin_session (id, admin_user_id, expires_at, created_at, last_active_at)
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(session_id.to_string())
         .bind(admin_id.to_string())
         .bind(expires_at.to_string())
+        .bind(now.to_string())
         .bind(now.to_string())
         .execute(&pool)
         .await
@@ -1257,14 +1419,73 @@ mod tests {
             .expect("authenticate admin");
         assert_eq!(authenticated, Some(AuthenticatedAdmin { id: admin_id }));
 
-        let row = sqlx::query("SELECT expires_at FROM admin_session WHERE id = ?")
+        let row = sqlx::query("SELECT expires_at, last_active_at FROM admin_session WHERE id = ?")
             .bind(session_id.to_string())
             .fetch_one(&pool)
             .await
             .expect("stored session");
         let updated_expiry =
             parse_zoned(row.get::<String, _>("expires_at").as_str()).expect("expiry should parse");
+        let updated_last_active = parse_zoned(row.get::<String, _>("last_active_at").as_str())
+            .expect("last_active_at should parse");
         assert!(updated_expiry > expires_at);
+        assert!(updated_last_active >= now);
+    }
+
+    #[tokio::test]
+    // logout では admin_session を削除できる。
+    async fn deletes_admin_session() {
+        let pool = setup_db().await;
+        let repo = SqliteRepository::new(pool.clone());
+        let admin_id = Uuid::now_v7();
+        let session_id = Uuid::now_v7();
+        let now = Zoned::now();
+        let password_hash = hash_password("secret");
+
+        sqlx::query(
+            "INSERT INTO admin_user (id, username, password_hash, display_name, is_active, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 1, ?, ?)",
+        )
+        .bind(admin_id.to_string())
+        .bind("admin")
+        .bind(password_hash)
+        .bind("管理者")
+        .bind(now.to_string())
+        .bind(now.to_string())
+        .execute(&pool)
+        .await
+        .expect("insert admin");
+
+        sqlx::query(
+            "INSERT INTO admin_session (id, admin_user_id, expires_at, created_at, last_active_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(session_id.to_string())
+        .bind(admin_id.to_string())
+        .bind(
+            session_expiry_from(&now)
+                .expect("session expiry")
+                .to_string(),
+        )
+        .bind(now.to_string())
+        .bind(now.to_string())
+        .execute(&pool)
+        .await
+        .expect("insert session");
+
+        let deleted_admin_id = repo
+            .delete_admin_session(&session_id.to_string())
+            .await
+            .expect("delete session");
+        assert_eq!(deleted_admin_id, Some(admin_id));
+
+        let remaining = sqlx::query("SELECT COUNT(*) AS count FROM admin_session WHERE id = ?")
+            .bind(session_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("remaining session count")
+            .get::<i64, _>("count");
+        assert_eq!(remaining, 0);
     }
 
     fn hash_password(password: &str) -> String {
