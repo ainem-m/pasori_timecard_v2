@@ -25,18 +25,21 @@ pub struct SubmitPunchRequest {
     pub card_id: String,
     pub event_type: PunchEventType,
     pub occurred_at: jiff::Zoned,
+    pub source: String,
 }
 
 #[derive(Clone)]
 pub struct ApiClient {
     base_url: String,
+    api_token: Option<String>,
     client: reqwest::Client,
 }
 
 impl ApiClient {
-    pub fn new(base_url: String) -> Self {
+    pub fn new(base_url: String, api_token: Option<String>) -> Self {
         Self {
             base_url,
+            api_token,
             client: reqwest::Client::new(),
         }
     }
@@ -47,39 +50,43 @@ impl ApiClient {
             .get(format!("{}/health", self.base_url))
             .send()
             .await?;
-        
+
         let time_str = resp
             .headers()
             .get("Server-Time")
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| anyhow::anyhow!("missing Server-Time header"))?;
-        
+
         Ok(time_str.parse()?)
     }
 
     pub async fn resolve_card(&self, card_id: &str) -> Result<CardScannedResponse> {
-        let resp = self
+        let mut req = self
             .client
             .get(format!("{}/terminals/me/card_scanned", self.base_url))
-            .query(&[("card_id", card_id)])
-            .send()
-            .await?;
-        
+            .query(&[("card_id", card_id)]);
+        if let Some(token) = &self.api_token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().await?;
+
         Ok(resp.json().await?)
     }
 
     pub async fn submit_punch(&self, req: SubmitPunchRequest) -> Result<PunchEvent> {
-        let resp = self
+        let mut request = self
             .client
             .post(format!("{}/terminals/me/punches", self.base_url))
-            .json(&req)
-            .send()
-            .await?;
-        
+            .json(&req);
+        if let Some(token) = &self.api_token {
+            request = request.bearer_auth(token);
+        }
+        let resp = request.send().await?;
+
         if !resp.status().is_success() {
             return Err(anyhow::anyhow!("API error: {}", resp.status()));
         }
-        
+
         Ok(resp.json().await?)
     }
 }

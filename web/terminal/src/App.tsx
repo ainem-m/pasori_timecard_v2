@@ -22,6 +22,10 @@ interface RegisteredResponse {
   suggested_type: PunchType;
 }
 
+type ResolveCardResponse =
+  | ({ status: 'registered' } & RegisteredResponse)
+  | { status: 'unregistered'; card_id: string };
+
 type ScanResult = 
   | { status: 'registered', data: RegisteredResponse }
   | { status: 'unregistered', card_id: string }
@@ -53,6 +57,14 @@ const Icons = {
 };
 
 const COUNTDOWN_MAX = 30;
+
+function parseReaderStatus(status: string): ReaderStatus {
+  if (status === 'Disconnected' || status === 'Connecting' || status === 'Ready') {
+    return status;
+  }
+
+  return { Error: status };
+}
 
 function App() {
   const [status, setStatus] = useState<ReaderStatus>('Connecting');
@@ -99,7 +111,7 @@ function App() {
     const checkStatus = async () => {
       try {
         const s = await invoke<string>('get_reader_status');
-        setStatus(s as any);
+        setStatus(parseReaderStatus(s));
       } catch (e) {
         setStatus({ Error: String(e) });
       }
@@ -125,6 +137,7 @@ function App() {
           card_id: scannedCardIdRef.current,
           event_type: type,
           occurred_at: now,
+          source: 'terminal',
         }
       });
       
@@ -154,9 +167,13 @@ function App() {
       setCountdown(null);
       
       try {
-        const res = await invoke<any>('resolve_card', { cardId: event.payload });
+        const res = await invoke<ResolveCardResponse>('resolve_card', { cardId: event.payload });
         if (res.status === 'registered') {
-          const data = res.registered;
+          const data: RegisteredResponse = {
+            employee: res.employee,
+            recent_events: res.recent_events,
+            suggested_type: res.suggested_type,
+          };
           setScanResult({ status: 'registered', data });
           setSuggestedType(data.suggested_type);
           setCountdown(COUNTDOWN_MAX);
@@ -164,7 +181,7 @@ function App() {
           setScanResult({ status: 'unregistered', card_id: res.card_id });
           setTimeout(() => setScanResult(null), 5000);
         }
-      } catch (e) {
+      } catch {
         setScanResult({ status: 'error', message: 'サーバーまたはカードの解析に失敗しました。' });
       }
     });

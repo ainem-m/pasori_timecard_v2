@@ -1,13 +1,24 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import App from './App'
 
+const fetchMock = vi.fn(async () => ({
+  ok: true,
+  json: async () => [],
+}))
+
 describe('Admin App', () => {
-  it('管理画面の見出しを表示する', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    fetchMock.mockClear()
+  })
+
+  it('管理画面の overview を表示する', async () => {
+    vi.stubGlobal('fetch', fetchMock)
+
     render(<App />)
 
-    expect(
-      screen.getByRole('heading', { name: 'PaSoRi Timecard Admin' }),
-    ).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Overview' })).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalled()
   })
 })

@@ -10,7 +10,8 @@ import {
   Bell,
   Menu,
   ChevronRight,
-  UserPlus
+  UserPlus,
+  type LucideIcon,
 } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -50,7 +51,7 @@ interface AuditLog {
 
 // --- Components ---
 
-const SidebarItem = ({ icon: Icon, label, active, onClick }: { icon: any, label: string, active?: boolean, onClick: () => void }) => (
+const SidebarItem = ({ icon: Icon, label, active, onClick }: { icon: LucideIcon, label: string, active?: boolean, onClick: () => void }) => (
   <button 
     onClick={onClick}
     className={cn(
@@ -66,7 +67,7 @@ const SidebarItem = ({ icon: Icon, label, active, onClick }: { icon: any, label:
   </button>
 );
 
-const StatCard = ({ title, value, icon: Icon, trend }: { title: string, value: string | number, icon: any, trend?: string }) => (
+const StatCard = ({ title, value, icon: Icon, trend }: { title: string, value: string | number, icon: LucideIcon, trend?: string }) => (
   <div className="card p-6 flex items-start justify-between">
     <div>
       <p className="text-sm font-medium text-muted-foreground mb-1">{title}</p>

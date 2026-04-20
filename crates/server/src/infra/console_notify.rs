@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use pasori_core::port::notify::{NotifyError, NotifyEvent, Notifier};
+use pasori_core::port::notify::{Notifier, NotifyError, NotifyEvent};
 
 pub struct ConsoleNotifier;
 

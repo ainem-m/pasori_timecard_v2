@@ -49,12 +49,33 @@ impl PunchUseCase {
 
         let Some(card) = card else {
             // 未登録カード
-            self.notifier
+            let _ = self
+                .audit_repo
+                .append(NewAuditLog {
+                    actor_type: "terminal".to_string(),
+                    actor_id: None,
+                    action: "unregistered_card_detected".to_string(),
+                    target_type: "card".to_string(),
+                    target_id: None,
+                    before_json: None,
+                    after_json: None,
+                    metadata_json: Some(
+                        serde_json::json!({
+                            "card_id": card_id.0,
+                            "detected_at": now.to_string(),
+                        })
+                        .to_string(),
+                    ),
+                })
+                .await;
+
+            let _ = self
+                .notifier
                 .notify(NotifyEvent::UnregisteredCardDetected {
                     card_id: card_id.clone(),
                     at: now.clone(),
                 })
-                .await?;
+                .await;
 
             return Ok(ResolvedCardScan::Unregistered {
                 card_id: card_id.clone(),
@@ -695,7 +716,7 @@ mod tests {
             }),
         });
         let punch_repo = Arc::new(MockPunchRepo);
-        let audit_repo = Arc::new(MockAuditRepo);
+        let audit_repo = Arc::new(MockAuditRepo::default());
         let notifier = Arc::new(MockNotifier::default());
         let punch_policy = Arc::new(crate::port::policy::DefaultPunchPolicy);
 
@@ -729,7 +750,7 @@ mod tests {
         let employee_repo = Arc::new(MockEmployeeRepo { employee: None });
         let card_repo = Arc::new(MockCardRepo { card: None });
         let punch_repo = Arc::new(MockPunchRepo);
-        let audit_repo = Arc::new(MockAuditRepo);
+        let audit_repo = Arc::new(MockAuditRepo::default());
         let notifier = Arc::new(MockNotifier::default());
         let punch_policy = Arc::new(crate::port::policy::DefaultPunchPolicy);
 
@@ -737,7 +758,7 @@ mod tests {
             employee_repo,
             card_repo,
             punch_repo,
-            audit_repo,
+            audit_repo.clone(),
             notifier.clone(),
             punch_policy,
         );
@@ -759,6 +780,10 @@ mod tests {
             events[0],
             crate::port::notify::NotifyEvent::UnregisteredCardDetected { .. }
         ));
+
+        let audit_entries = audit_repo.entries.lock().await;
+        assert_eq!(audit_entries.len(), 1);
+        assert_eq!(audit_entries[0].action, "unregistered_card_detected");
     }
 
     struct MockEmployeeRepo {
@@ -855,10 +880,14 @@ mod tests {
         }
     }
 
-    struct MockAuditRepo;
+    #[derive(Default)]
+    struct MockAuditRepo {
+        entries: Mutex<Vec<crate::domain::audit::NewAuditLog>>,
+    }
     #[async_trait::async_trait]
     impl crate::port::repo::AuditLogRepository for MockAuditRepo {
-        async fn append(&self, _: crate::domain::audit::NewAuditLog) -> Result<(), RepoError> {
+        async fn append(&self, entry: crate::domain::audit::NewAuditLog) -> Result<(), RepoError> {
+            self.entries.lock().await.push(entry);
             Ok(())
         }
         async fn list(

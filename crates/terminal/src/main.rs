@@ -1,7 +1,7 @@
 mod api_client;
+mod offline;
 mod rcs380;
 mod reader;
-mod offline;
 
 use anyhow::Result;
 use pasori_core::port::reader::ReaderBackend;
@@ -46,10 +46,16 @@ async fn submit_punch(
     req: api_client::SubmitPunchRequest,
 ) -> Result<pasori_core::domain::punch::PunchEvent, String> {
     // 1. Save to local cache first (robustness)
-    let punch_id = Uuid::parse_str(&req.punch_id.to_string()).unwrap_or(req.punch_id); 
+    let punch_id = req.punch_id;
     state
         .offline_repo
-        .save_punch(punch_id, &req.card_id, &format!("{:?}", req.event_type), &req.occurred_at)
+        .save_punch(
+            punch_id,
+            &req.card_id,
+            &format!("{:?}", req.event_type),
+            &req.occurred_at,
+            "local_cached",
+        )
         .await
         .map_err(|e| format!("failed to save local cache: {}", e))?;
 
@@ -57,19 +63,22 @@ async fn submit_punch(
     match state.api_client.submit_punch(req.clone()).await {
         Ok(event) => {
             // Success! Mark as synced
-            let _ = state.offline_repo.mark_as_synced(punch_id, &jiff::Zoned::now()).await;
+            let _ = state
+                .offline_repo
+                .mark_as_synced(punch_id, &jiff::Zoned::now())
+                .await;
             Ok(event)
         }
         Err(e) => {
             // Failed (offline?), but it's okay because it's in the cache.
             tracing::warn!(error = %e, "failed to submit punch to server, will retry later");
-            
+
             // Return a "pending" event so UI can proceed
             Ok(pasori_core::domain::punch::PunchEvent {
                 id: punch_id,
                 employee_id: Uuid::nil(), // Unknown yet
                 card_id: None,
-                event_type: req.event_type.into(),
+                event_type: req.event_type,
                 occurred_at: req.occurred_at.clone(),
                 server_recorded_at: req.occurred_at.clone(), // Placeholder
                 source: "local_cached".to_string(),
@@ -84,11 +93,16 @@ async fn submit_punch(
 
 #[tauri::command]
 async fn check_clock_sync(state: State<'_, AppState>) -> Result<ClockStatus, String> {
-    let server_time = state.api_client.health_check().await.map_err(|e| e.to_string())?;
+    let server_time = state
+        .api_client
+        .health_check()
+        .await
+        .map_err(|e| e.to_string())?;
     let local_time = jiff::Zoned::now();
-    
-    let offset_seconds = (server_time.timestamp().as_second() - local_time.timestamp().as_second()).abs();
-    
+
+    let offset_seconds =
+        (server_time.timestamp().as_second() - local_time.timestamp().as_second()).abs();
+
     Ok(ClockStatus {
         is_synced: offset_seconds <= 10,
         server_time,
@@ -106,12 +120,15 @@ async fn main() -> Result<()> {
     tracing::info!("PaSoRi terminal starting...");
 
     // 1. Api Client
-    let api_url = std::env::var("SERVER_API_URL").unwrap_or_else(|_| "http://localhost:8080/api".to_string());
-    let api_client = api_client::ApiClient::new(api_url);
+    let api_url =
+        std::env::var("SERVER_API_URL").unwrap_or_else(|_| "http://localhost:8080/api".to_string());
+    let api_token = std::env::var("TERMINAL_API_TOKEN").ok();
+    let api_client = api_client::ApiClient::new(api_url, api_token);
 
     // 2. Reader Backend
-    let backend: Arc<dyn ReaderBackend> = Arc::from(reader::detect_and_create().map_err(|e| anyhow::anyhow!(e))?);
-    
+    let backend: Arc<dyn ReaderBackend> =
+        Arc::from(reader::detect_and_create().map_err(|e| anyhow::anyhow!(e))?);
+
     // Start backend
     backend.start().await.map_err(|e| anyhow::anyhow!(e))?;
 
@@ -124,7 +141,7 @@ async fn main() -> Result<()> {
     // 4. Tauri App
     let offline_repo_for_setup = offline_repo.clone();
     let api_client_for_setup = api_client.clone();
-    
+
     tauri::Builder::default()
         .manage(AppState {
             backend: backend.clone(),
@@ -140,7 +157,7 @@ async fn main() -> Result<()> {
         .setup(move |app| {
             let reader_handle = app.handle().clone();
             let mut rx = backend.subscribe();
-            
+
             // Bridge broadcast channel to Tauri events
             tauri::async_runtime::spawn(async move {
                 while let Ok(scanned) = rx.recv().await {
@@ -168,6 +185,7 @@ async fn main() -> Result<()> {
                                     card_id: punch.card_id,
                                     event_type,
                                     occurred_at: punch.occurred_at,
+                                    source: punch.source,
                                 };
                                 match api_client_for_setup.submit_punch(req).await {
                                     Ok(_) => {

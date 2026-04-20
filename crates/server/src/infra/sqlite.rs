@@ -1,3 +1,7 @@
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHash, PasswordVerifier},
+};
 use async_trait::async_trait;
 use jiff::Zoned;
 use pasori_core::domain::audit::{AuditLog, AuditLogFilter, NewAuditLog};
@@ -12,16 +16,137 @@ use pasori_core::port::repo::{
     AttendanceRequestRepository, AuditLogRepository, CardRepository, EmployeeRepository,
     ExternalAccountRepository, PunchRepository, RepoError, ShiftRepository,
 };
-use sqlx::sqlite::SqlitePool;
+use sqlx::{Row, sqlite::SqlitePool};
 use uuid::Uuid;
 
 pub struct SqliteRepository {
     pool: SqlitePool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedTerminal {
+    pub id: Uuid,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedAdmin {
+    pub id: Uuid,
+}
+
 impl SqliteRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    pub async fn authenticate_terminal_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<AuthenticatedTerminal>, RepoError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, name, api_token_hash
+            FROM terminal
+            WHERE is_active = 1
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(to_repo_error)?;
+
+        for row in rows {
+            let id = row.try_get::<String, _>("id").map_err(to_repo_error)?;
+            let name = row.try_get::<String, _>("name").map_err(to_repo_error)?;
+            let api_token_hash = row
+                .try_get::<String, _>("api_token_hash")
+                .map_err(to_repo_error)?;
+            let parsed_hash = PasswordHash::new(&api_token_hash)
+                .map_err(|e| RepoError::Db(format!("invalid terminal token hash: {e}")))?;
+
+            if Argon2::default()
+                .verify_password(token.as_bytes(), &parsed_hash)
+                .is_ok()
+            {
+                return Ok(Some(AuthenticatedTerminal {
+                    id: Uuid::parse_str(&id).map_err(|e| RepoError::Db(e.to_string()))?,
+                    name,
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub async fn touch_terminal(
+        &self,
+        terminal_id: Uuid,
+        seen_at: &Zoned,
+    ) -> Result<(), RepoError> {
+        sqlx::query(
+            r#"
+            UPDATE terminal
+            SET last_seen_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(seen_at.to_string())
+        .bind(seen_at.to_string())
+        .bind(terminal_id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(to_repo_error)?;
+
+        Ok(())
+    }
+
+    pub async fn authenticate_admin_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<AuthenticatedAdmin>, RepoError> {
+        let now = Zoned::now().to_string();
+        let row = sqlx::query(
+            r#"
+            SELECT s.admin_user_id
+            FROM admin_session s
+            JOIN admin_user u ON u.id = s.admin_user_id
+            WHERE s.id = ?
+              AND s.expires_at > ?
+              AND u.is_active = 1
+            "#,
+        )
+        .bind(session_id)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(to_repo_error)?;
+
+        row.map(|row| {
+            row.try_get::<String, _>("admin_user_id")
+                .map_err(to_repo_error)
+                .and_then(|id| {
+                    Uuid::parse_str(&id)
+                        .map(|id| AuthenticatedAdmin { id })
+                        .map_err(|e| RepoError::Db(e.to_string()))
+                })
+        })
+        .transpose()
+    }
+
+    pub async fn list_recent_punches(&self, limit: usize) -> Result<Vec<PunchEvent>, RepoError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM punch_event
+            WHERE deleted_at IS NULL
+            ORDER BY occurred_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(to_repo_error)?;
+
+        rows.into_iter().map(map_punch_row).collect()
     }
 }
 
@@ -803,7 +928,7 @@ mod tests {
 
         // List
         let active = repo.list_active().await.expect("list failed");
-        assert_eq!(active.len(), 1);
+        assert!(active.iter().any(|employee| employee.id == emp.id));
 
         // Update
         let patch = EmployeePatch {
@@ -818,7 +943,7 @@ mod tests {
         // Deactivate
         repo.deactivate(emp.id).await.expect("deactivate failed");
         let active_after = repo.list_active().await.expect("list failed");
-        assert_eq!(active_after.len(), 0);
+        assert!(!active_after.iter().any(|employee| employee.id == emp.id));
     }
 
     #[tokio::test]

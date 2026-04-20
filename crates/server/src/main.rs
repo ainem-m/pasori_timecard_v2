@@ -14,11 +14,11 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     tracing::info!("server workspace status = {}", WORKSPACE_STATUS);
 
-    let database_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:pasori_timecard.db?mode=rwc".to_string());
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "sqlite:pasori_timecard.db?mode=rwc".to_string());
 
     tracing::info!(database_url, "connecting to database...");
-    
+
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect(&database_url)
@@ -32,19 +32,19 @@ async fn main() -> Result<()> {
 
     let repo = Arc::new(SqliteRepository::new(pool));
 
-    let notifier: Arc<dyn pasori_core::port::notify::Notifier> =
-        match (std::env::var("LINEWORKS_BOT_ID"), std::env::var("LINEWORKS_API_TOKEN")) {
-            (Ok(bot_id), Ok(bot_token)) => {
-                tracing::info!("LINE WORKS notifier initialized");
-                Arc::new(LineworksNotifier::new(bot_id, bot_token))
-            }
-            _ => {
-                tracing::warn!("LINE WORKS credentials missing, falling back to ConsoleNotifier");
-                Arc::new(server::infra::console_notify::ConsoleNotifier)
-            }
-        };
-
-    let bot_secret = std::env::var("LINEWORKS_BOT_SECRET").unwrap_or_else(|_| "dummy_secret".to_string());
+    let notifier: Arc<dyn pasori_core::port::notify::Notifier> = match (
+        std::env::var("LINEWORKS_BOT_ID"),
+        std::env::var("LINEWORKS_API_TOKEN"),
+    ) {
+        (Ok(bot_id), Ok(bot_token)) => {
+            tracing::info!("LINE WORKS notifier initialized");
+            Arc::new(LineworksNotifier::new(bot_id, bot_token))
+        }
+        _ => {
+            tracing::warn!("LINE WORKS credentials missing, falling back to ConsoleNotifier");
+            Arc::new(server::infra::console_notify::ConsoleNotifier)
+        }
+    };
 
     let punch_policy = Arc::new(DefaultPunchPolicy);
 
@@ -65,10 +65,23 @@ async fn main() -> Result<()> {
         notifier.clone(),
     ));
 
-    let api_router = axum::Router::new()
-        .merge(lineworks::router(bot_secret.into_bytes(), lineworks_use_case))
-        .merge(server::terminal::router(punch_use_case))
-        .merge(server::admin::router(repo.clone(), repo.clone(), repo.clone()));
+    let mut api_router = axum::Router::new()
+        .merge(server::terminal::router(punch_use_case, repo.clone()))
+        .merge(server::admin::router(repo.clone()));
+
+    match std::env::var("LINEWORKS_BOT_SECRET") {
+        Ok(bot_secret) => {
+            api_router = api_router.merge(lineworks::router(
+                bot_secret.into_bytes(),
+                lineworks_use_case,
+            ));
+        }
+        Err(_) => {
+            tracing::warn!(
+                "LINEWORKS_BOT_SECRET is missing, LINE WORKS callback route is disabled"
+            );
+        }
+    }
 
     let app = axum::Router::new()
         .nest("/api", api_router)

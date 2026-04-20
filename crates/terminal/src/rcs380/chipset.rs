@@ -47,24 +47,24 @@ impl<T: Transport> Chipset<T> {
         // Step 1: SetCommandType(1) — Port-100 拡張コマンドモードを有効化
         tracing::debug!("Step 1: SetCommandType(1)");
         self.send_command_and_recv(&[0xD6, 0x2A, 0x01])?;
- 
+
         // Step 2: GetFirmwareVersion
         tracing::debug!("Step 2: GetFirmwareVersion");
         let ver = self.get_firmware_version()?;
         tracing::info!(fw = %ver, "RC-S380 firmware version");
- 
+
         // Step 3: GetPDDataVersion (nfcpy Chipset.__init__ で必須)
         tracing::debug!("Step 3: GetPDDataVersion");
         self.send_command_and_recv(&[0xD6, 0x22])?;
- 
+
         // Step 4: SwitchRF off
         tracing::debug!("Step 4: SwitchRF off");
         self.send_command_and_recv(&[0xD6, 0x06, 0x00])?;
- 
+
         // Step 5: InSetRF (212F: send_set=1, comm_type=0x01, recv_set=0x0F, recv_comm_type=0x01)
         tracing::debug!("Step 5: InSetRF");
         self.send_command_and_recv(&[0xD6, 0x00, 0x01, 0x01, 0x0F, 0x01])?;
- 
+
         // Step 6: InSetProtocol (nfcpy in_set_protocol_defaults — tag-value ペア, END マーカーなし)
         tracing::debug!("Step 6: InSetProtocol");
         #[rustfmt::skip]
@@ -91,7 +91,7 @@ impl<T: Transport> Chipset<T> {
         let mut protocol_cmd = vec![0xD6u8, 0x02];
         protocol_cmd.extend_from_slice(&defaults_payload);
         self.send_command_and_recv(&protocol_cmd)?;
- 
+
         Ok(())
     }
 
@@ -185,11 +185,11 @@ impl<T: Transport> Chipset<T> {
         let frame = frame::encode(cmd);
         tracing::trace!(cmd = ?cmd, "sending USB frame");
         self.transport.send(&frame)?;
- 
+
         tracing::trace!("waiting for ACK...");
         let mut ack_buf = [0u8; 512];
         let ack_size = self.transport.recv(&mut ack_buf, 1000)?;
- 
+
         let is_ack = ack_size == 6 && ack_buf[..6] == [0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00];
         if !is_ack {
             tracing::debug!(size = ack_size, hex = ?&ack_buf[..ack_size], "received non-ACK instead of ACK");
@@ -207,13 +207,13 @@ impl<T: Transport> Chipset<T> {
             };
         }
         tracing::trace!("ACK received");
- 
+
         tracing::trace!("waiting for response data...");
         let mut resp_buf = [0u8; 512];
         let resp_size = self.transport.recv(&mut resp_buf, 2500)?;
         let data = resp_buf[..resp_size].to_vec();
         tracing::trace!(size = resp_size, "response data received");
- 
+
         match frame::decode(&data)? {
             DecodedFrame::Data(p) => Ok(p),
             DecodedFrame::Ack => Err(ChipsetError::Protocol(
