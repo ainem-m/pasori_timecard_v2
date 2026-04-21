@@ -19,20 +19,79 @@
 - ただしこのブランチを救済する目的なら、少なくとも「ビルド修正」「認証」「監査/打刻整合」「テスト追随」は分離して進める
 - 実装順は `core` → `server` / `terminal` → `web` → test の順にする
 
+## 進捗棚卸し (2026-04-21)
+
+### 現在の要約
+
+- Rust workspace の基本構成 (`core` / `server` / `terminal` / `import_v1`) は作成済み
+- SQLite migration は初期スキーマ、テストデータ、admin lockout/session activity まで投入済み
+- Terminal API の Bearer 認証、Admin API の session cookie 認証は実装済み
+- 未登録カード検出の `audit_log` 記録、およびオフライン再送時の `source=local_cached` 保持は実装済み
+- LINE WORKS callback の署名検証と基本的なコマンド解析は実装済み
+- `web/admin` と `web/terminal` は最低限の画面とテストを持つ
+
+### 完了した項目
+
+- `terminal` crate のコンパイルは通る状態まで修正済み
+- Terminal API の Bearer 認証を実装済み
+- Admin API の Session + Cookie 認証を実装済み
+- `LINEWORKS_BOT_SECRET` 未設定時の unsafe fallback は削除済み
+- 未登録カード検出時の `audit_log` 記録を追加済み
+- オフライン再送で `source=local_cached` を保持する実装を追加済み
+- Rust test と frontend test の最小系は green
+
+### 進行中の項目
+
+- Admin 勤怠 API は `GET /api/admin/attendance/monthly?employee_id=...&year=...&month=...` を返す月次勤怠 endpoint まで実装済み
+- ただし既定締め日 15 日の固定実装で、settings 連動や Admin UI からの利用までは未完了
+- `web/admin` の attendance 画面は月次勤怠 endpoint を利用するよう更新済み
+- ただし従業員管理・打刻修正・シフト管理の完成形には未到達
+- `web/terminal` は打刻 UI の happy path が中心で、オフライン時の確認 UI や設定まわりは未整理
+
+### 未着手または未完了の項目
+
+- LINE WORKS の修正申請承認フロー、追加通知分岐
+- `import_v1` の実データ移行処理
+- DoD にある lint / typecheck / fmt / clippy / 起動確認の完走
+- E2E (`pnpm -C web/terminal test:e2e`) の整備と実行
+
+### 実装上の残課題
+
+- `crates/server/src/lineworks.rs` に `unimplemented!()` が残っている
+- `crates/core/src/application/lineworks.rs` に修正申請フロー向けの暫定 TODO が残っている
+- `crates/server/src/infra/lineworks_notify.rs` は一部通知イベントのみ実装
+- `crates/import_v1/src/main.rs` は stub のまま
+
+### 検証状況
+
+- 2026-04-21 時点で `cargo test --workspace` は green
+- 2026-04-21 時点で `pnpm -C web/admin test -- --run` は green
+- 2026-04-21 時点で `pnpm -C web/terminal test -- --run` は green
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, 各 frontend の `lint` / `typecheck`, 起動確認は未実行
+
+### 次に着手すべき順序
+
+1. Admin 勤怠 API の仕様固定と employee / 期間ベース化
+2. LINE WORKS use case の未実装分岐を完了
+3. `import_v1` の移行 CLI を実装
+4. DoD の検証コマンドを一式 green にする
+
 ## TODO
 
-- [ ] `terminal` crate のコンパイルエラーを修正する
-- [ ] Terminal API を Bearer 認証仕様に合わせる
-- [ ] Admin API を Session + Cookie 前提に揃える
-- [ ] LINE WORKS secret の unsafe fallback を削除する
-- [ ] 未登録カード検出時の audit 記録を追加する
-- [ ] オフライン再送で `source=local_cached` を保持する
+- [x] `terminal` crate のコンパイルエラーを修正する
+- [x] Terminal API を Bearer 認証仕様に合わせる
+- [x] Admin API を Session + Cookie 前提に揃える
+- [x] LINE WORKS secret の unsafe fallback を削除する
+- [x] 未登録カード検出時の audit 記録を追加する
+- [x] オフライン再送で `source=local_cached` を保持する
 - [ ] Admin 勤怠一覧 API を仕様に沿う形へ修正する
 - [ ] Frontend / Rust の検証を green にする
 
 ## 詳細タスク
 
 ### 1. `terminal` crate のコンパイル修正
+
+状況: 完了
 
 - 対象: `crates/terminal/src/rcs380/transport.rs`
 - `raw_exchange` の引数型を `UsbTransport::open()` が返す handle 型に合わせる
@@ -44,6 +103,8 @@
 - `cargo test -p terminal` が少なくともコンパイルを通過する
 
 ### 2. Terminal API の Bearer 認証
+
+状況: 完了
 
 - 対象: `crates/server/src/terminal.rs`
 - 対象: `crates/terminal/src/api_client.rs`
@@ -65,6 +126,8 @@
 
 ### 3. Admin API の Session + Cookie 対応
 
+状況: 完了
+
 - 対象: `crates/server/src/admin.rs`
 - 対象: 関連する session 管理コード一式
 
@@ -82,6 +145,8 @@
 
 ### 4. LINE WORKS secret fallback の削除
 
+状況: 完了
+
 - 対象: `crates/server/src/main.rs`
 - 対象: `crates/server/src/lineworks.rs`
 
@@ -98,6 +163,8 @@
 
 ### 5. 未登録カード検出の監査ログ
 
+状況: 完了
+
 - 対象: `crates/core/src/application/attendance.rs`
 - 対象: `crates/server/src/infra/sqlite.rs` の audit append 経路
 
@@ -113,6 +180,8 @@
 - 通知失敗が打刻系レスポンス失敗に連鎖しない
 
 ### 6. オフライン再送の `source=local_cached`
+
+状況: 完了
 
 - 対象: `crates/terminal/src/offline.rs`
 - 対象: `crates/terminal/src/api_client.rs`
@@ -132,6 +201,14 @@
 
 ### 7. Admin 勤怠一覧 API の修正
 
+状況: 部分完了
+
+- `Uuid::nil()` + `now..now` の暫定実装は解消済み
+- `GET /api/admin/attendance/monthly` で employee / year / month 指定の月次勤怠レスポンスを返せる
+- 既定締め日は 15 日固定で、settings 連動は未実装
+- `web/admin` の attendance 画面は新 endpoint を利用するよう更新済み
+- dashboard の recent attendance や統計では引き続き `/admin/punches` の raw 一覧を利用している
+
 - 対象: `crates/server/src/admin.rs`
 - 対象: 必要なら `core` の集計 use case
 
@@ -149,6 +226,12 @@
 - 締め日基準の期間計算に将来接続できる構造になっている
 
 ### 8. テスト修正と追加
+
+状況: 部分完了
+
+- Rust workspace test は green
+- `web/admin` / `web/terminal` の vitest は green
+- DoD にある lint / typecheck / fmt / clippy は未実行
 
 - 対象: `web/admin/src/App.test.tsx`
 - 対象: `web/terminal/src/App.test.tsx`

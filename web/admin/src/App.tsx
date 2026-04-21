@@ -36,7 +36,7 @@ interface Employee {
 interface PunchEvent {
   id: string;
   employee_id: string;
-  event_type: 'ClockIn' | 'ClockOut';
+  event_type: 'clock_in' | 'clock_out' | 'break_start' | 'break_end' | 'temporary_out' | 'temporary_return' | 'manual_correction';
   occurred_at: string;
   source: string;
 }
@@ -52,6 +52,63 @@ interface AuditLog {
 interface LoginFormState {
   username: string;
   password: string;
+}
+
+interface AttendanceDay {
+  date: string;
+  events: PunchEvent[];
+  work_minutes: number;
+  has_inconsistency: boolean;
+  status: 'unconfirmed' | 'confirmed' | 'locked';
+}
+
+interface MonthlyAttendance {
+  employee_id: string;
+  year_month: {
+    year: number;
+    month: number;
+  };
+  days: AttendanceDay[];
+  total_work_minutes: number;
+  cutoff_rule:
+    | {
+        type: 'day_of_month';
+        day: number;
+      }
+    | {
+        type: 'end_of_month';
+      };
+  period_start: string;
+  period_end: string;
+}
+
+function formatPunchEventLabel(eventType: PunchEvent['event_type']) {
+  switch (eventType) {
+    case 'clock_in':
+      return '出勤';
+    case 'clock_out':
+      return '退勤';
+    case 'break_start':
+      return '休憩開始';
+    case 'break_end':
+      return '休憩終了';
+    case 'temporary_out':
+      return '一時外出';
+    case 'temporary_return':
+      return '戻り';
+    case 'manual_correction':
+      return '修正';
+  }
+}
+
+function formatMinutes(totalMinutes: number) {
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours}h ${minutes}m`;
+}
+
+function buildCurrentYearMonth() {
+  return format(new Date(), 'yyyy-MM');
 }
 
 // --- Components ---
@@ -92,10 +149,14 @@ export default function App() {
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [punches, setPunches] = useState<PunchEvent[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+  const [monthlyAttendance, setMonthlyAttendance] = useState<MonthlyAttendance | null>(null);
   const [isLoading, setLoading] = useState(true);
+  const [isAttendanceLoading, setAttendanceLoading] = useState(false);
   const [needsLogin, setNeedsLogin] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
   const [loginForm, setLoginForm] = useState<LoginFormState>({ username: '', password: '' });
+  const [selectedEmployeeId, setSelectedEmployeeId] = useState('');
+  const [selectedYearMonth, setSelectedYearMonth] = useState(buildCurrentYearMonth);
 
   async function fetchData() {
     setLoading(true);
@@ -127,6 +188,57 @@ export default function App() {
   useEffect(() => {
     fetchData();
   }, [view]);
+
+  useEffect(() => {
+    if (employees.length === 0) {
+      return;
+    }
+
+    const selectedEmployeeStillExists = employees.some((employee) => employee.id === selectedEmployeeId);
+    if (!selectedEmployeeStillExists) {
+      setSelectedEmployeeId(employees[0].id);
+    }
+  }, [employees, selectedEmployeeId]);
+
+  useEffect(() => {
+    async function fetchMonthlyAttendance() {
+      if (view !== 'attendance' || !selectedEmployeeId) {
+        return;
+      }
+
+      const [year, month] = selectedYearMonth.split('-');
+      if (!year || !month) {
+        return;
+      }
+
+      setAttendanceLoading(true);
+      try {
+        const response = await fetch(
+          `/api/admin/attendance/monthly?employee_id=${selectedEmployeeId}&year=${year}&month=${month}`,
+          { credentials: 'same-origin' },
+        );
+
+        if (response.status === 401) {
+          setNeedsLogin(true);
+          return;
+        }
+
+        if (!response.ok) {
+          setMonthlyAttendance(null);
+          return;
+        }
+
+        setMonthlyAttendance(await response.json());
+      } catch (err) {
+        console.error('Failed to fetch monthly attendance', err);
+        setMonthlyAttendance(null);
+      } finally {
+        setAttendanceLoading(false);
+      }
+    }
+
+    fetchMonthlyAttendance();
+  }, [view, selectedEmployeeId, selectedYearMonth]);
 
   async function handleLoginSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -313,13 +425,13 @@ export default function App() {
                         <div className="flex items-center gap-3">
                           <div className={cn(
                             "w-2 h-2 rounded-full",
-                            punch.event_type === 'ClockIn' ? "bg-green-500" : "bg-red-500"
+                            punch.event_type === 'clock_in' ? "bg-green-500" : "bg-red-500"
                           )} />
                           <div>
                             <p className="font-medium text-sm">
                               {employees.find(e => e.id === punch.employee_id)?.display_name || 'Unknown'}
                             </p>
-                            <p className="text-xs text-muted-foreground">{punch.event_type}</p>
+                            <p className="text-xs text-muted-foreground">{formatPunchEventLabel(punch.event_type)}</p>
                           </div>
                       </div>
                       <p className="text-sm text-muted-foreground">{format(new Date(punch.occurred_at), 'HH:mm:ss')}</p>
@@ -411,42 +523,114 @@ export default function App() {
 
           {view === 'attendance' && (
             <div className="space-y-6 animate-in fade-in slide-in-from-right-2 duration-500">
-               <div>
+              <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+                <div>
                   <h2 className="text-2xl font-bold">Attendance Records</h2>
-                  <p className="text-muted-foreground mt-1 text-sm">Full punch history logs</p>
+                  <p className="text-muted-foreground mt-1 text-sm">Monthly attendance view by employee and cutoff period</p>
                 </div>
+                <div className="flex flex-col gap-3 sm:flex-row">
+                  <label className="flex flex-col gap-2 text-sm">
+                    <span className="font-medium text-muted-foreground">Employee</span>
+                    <select
+                      aria-label="Employee"
+                      className="rounded-lg border border-border bg-background px-3 py-2"
+                      value={selectedEmployeeId}
+                      onChange={(event) => setSelectedEmployeeId(event.target.value)}
+                    >
+                      {employees.map((employee) => (
+                        <option key={employee.id} value={employee.id}>
+                          {employee.display_name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="flex flex-col gap-2 text-sm">
+                    <span className="font-medium text-muted-foreground">Month</span>
+                    <input
+                      aria-label="Month"
+                      type="month"
+                      className="rounded-lg border border-border bg-background px-3 py-2"
+                      value={selectedYearMonth}
+                      onChange={(event) => setSelectedYearMonth(event.target.value)}
+                    />
+                  </label>
+                </div>
+              </div>
+
+              {monthlyAttendance && (
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+                  <div className="card p-5">
+                    <p className="text-sm text-muted-foreground">Attendance Period</p>
+                    <p className="mt-2 text-lg font-semibold">
+                      {monthlyAttendance.period_start} - {monthlyAttendance.period_end}
+                    </p>
+                  </div>
+                  <div className="card p-5">
+                    <p className="text-sm text-muted-foreground">Total Work</p>
+                    <p className="mt-2 text-lg font-semibold">{formatMinutes(monthlyAttendance.total_work_minutes)}</p>
+                  </div>
+                  <div className="card p-5">
+                    <p className="text-sm text-muted-foreground">Attendance Days</p>
+                    <p className="mt-2 text-lg font-semibold">{monthlyAttendance.days.length} days</p>
+                  </div>
+                </div>
+              )}
+
               <div className="card">
                 <table className="w-full text-left">
                   <thead className="bg-muted/50 border-b border-border">
                     <tr>
-                      <th className="px-6 py-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Time</th>
-                      <th className="px-6 py-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Employee</th>
-                      <th className="px-6 py-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Event</th>
-                      <th className="px-6 py-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Source</th>
+                      <th className="px-6 py-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Date</th>
+                      <th className="px-6 py-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Events</th>
+                      <th className="px-6 py-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Work</th>
+                      <th className="px-6 py-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Status</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-border">
-                    {punches.map(p => (
-                      <tr key={p.id} className="hover:bg-accent/30 transition-colors">
+                    {isAttendanceLoading && (
+                      <tr>
+                        <td colSpan={4} className="px-6 py-8 text-center text-sm text-muted-foreground">
+                          Loading monthly attendance...
+                        </td>
+                      </tr>
+                    )}
+                    {!isAttendanceLoading && monthlyAttendance?.days.map((day) => (
+                      <tr key={day.date} className="hover:bg-accent/30 transition-colors">
                         <td className="px-6 py-4 text-sm font-mono text-muted-foreground">
-                          {format(new Date(p.occurred_at), 'MM/dd HH:mm:ss')}
+                          {day.date}
                         </td>
-                        <td className="px-6 py-4 font-medium">
-                          {employees.find(e => e.id === p.employee_id)?.display_name || 'Deleted User'}
+                        <td className="px-6 py-4 text-sm">
+                          <div className="space-y-1">
+                            {day.events.map((event) => (
+                              <div key={event.id} className="flex items-center gap-2 text-muted-foreground">
+                                <span className="font-mono">{format(new Date(event.occurred_at), 'HH:mm')}</span>
+                                <span>{formatPunchEventLabel(event.event_type)}</span>
+                              </div>
+                            ))}
+                          </div>
                         </td>
-                        <td className="px-6 py-4">
-                          <span className={cn(
-                            "px-2 py-1 rounded text-xs font-bold",
-                            p.event_type === 'ClockIn' ? "text-green-500" : "text-red-500"
-                          )}>
-                            {p.event_type.toUpperCase()}
-                          </span>
+                        <td className="px-6 py-4 text-sm font-semibold">
+                          {formatMinutes(day.work_minutes)}
                         </td>
-                        <td className="px-6 py-4 text-xs uppercase text-muted-foreground font-semibold">
-                          {p.source}
+                        <td className="px-6 py-4 text-sm">
+                          <div className="flex items-center gap-2">
+                            <span className="capitalize">{day.status}</span>
+                            {day.has_inconsistency && (
+                              <span className="rounded bg-amber-100 px-2 py-1 text-xs font-medium text-amber-700">
+                                Warning
+                              </span>
+                            )}
+                          </div>
                         </td>
                       </tr>
                     ))}
+                    {!isAttendanceLoading && monthlyAttendance && monthlyAttendance.days.length === 0 && (
+                      <tr>
+                        <td colSpan={4} className="px-6 py-8 text-center text-sm text-muted-foreground">
+                          No attendance records in this period
+                        </td>
+                      </tr>
+                    )}
                   </tbody>
                 </table>
               </div>

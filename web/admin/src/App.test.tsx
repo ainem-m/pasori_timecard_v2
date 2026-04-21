@@ -4,6 +4,14 @@ import App from './App'
 
 const fetchMock = vi.fn()
 
+function okJson(json: unknown) {
+  return {
+    ok: true,
+    status: 200,
+    json: async () => json,
+  }
+}
+
 describe('Admin App', () => {
   afterEach(() => {
     cleanup()
@@ -12,11 +20,7 @@ describe('Admin App', () => {
   })
 
   it('管理画面の overview を表示する', async () => {
-    fetchMock.mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => [],
-    })
+    fetchMock.mockResolvedValue(okJson([]))
     vi.stubGlobal('fetch', fetchMock)
 
     render(<App />)
@@ -96,5 +100,71 @@ describe('Admin App', () => {
       }))
     })
     expect(await screen.findByRole('heading', { name: 'Admin Login' })).toBeInTheDocument()
+  })
+
+  it('attendance 画面で月次勤怠を表示する', async () => {
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.startsWith('/api/admin/attendance/monthly')) {
+        return okJson({
+          employee_id: 'emp-1',
+          year_month: { year: 2026, month: 4 },
+          period_start: '2026-03-16',
+          period_end: '2026-04-15',
+          total_work_minutes: 1050,
+          cutoff_rule: { type: 'day_of_month', day: 15 },
+          days: [
+            {
+              date: '2026-03-16',
+              work_minutes: 540,
+              has_inconsistency: false,
+              status: 'confirmed',
+              events: [
+                { id: 'p1', employee_id: 'emp-1', event_type: 'clock_in', occurred_at: '2026-03-16T09:00:00+09:00', source: 'nfc' },
+                { id: 'p2', employee_id: 'emp-1', event_type: 'clock_out', occurred_at: '2026-03-16T18:00:00+09:00', source: 'nfc' },
+              ],
+            },
+          ],
+        })
+      }
+
+      if (input === '/api/admin/employees') {
+        return okJson([
+          {
+            id: 'emp-1',
+            display_name: '山田太郎',
+            employment_type: 'regular',
+            affiliation: '受付',
+            is_active: true,
+            created_at: '2026-04-20T00:00:00+09:00',
+          },
+        ])
+      }
+
+      if (input === '/api/admin/punches' || input === '/api/admin/audit_logs') {
+        return okJson([])
+      }
+
+      return {
+        ok: false,
+        status: 404,
+        json: async () => [],
+      }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<App />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Attendance' }))
+
+    expect(await screen.findByText('2026-03-16 - 2026-04-15')).toBeInTheDocument()
+    expect(await screen.findByText('17h 30m')).toBeInTheDocument()
+    expect(await screen.findByText('山田太郎')).toBeInTheDocument()
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/admin/attendance/monthly?employee_id=emp-1&year=2026&month=04',
+        expect.objectContaining({ credentials: 'same-origin' }),
+      )
+    })
   })
 })
