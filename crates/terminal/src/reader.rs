@@ -32,7 +32,9 @@ impl PcscReaderBackend {
     }
 
     fn set_status(&self, s: ReaderStatus) {
-        *self.status.lock().expect("status lock") = s;
+        if let Err(error) = set_shared_status(&self.status, s) {
+            tracing::error!(%error, "failed to update PC/SC reader status");
+        }
     }
 }
 
@@ -45,7 +47,10 @@ impl Default for PcscReaderBackend {
 #[async_trait::async_trait]
 impl ReaderBackend for PcscReaderBackend {
     async fn start(&self) -> Result<(), ReaderError> {
-        let mut handle_guard = self.handle.lock().expect("handle lock");
+        let mut handle_guard = self
+            .handle
+            .lock()
+            .map_err(|_| ReaderError::Other("handle lock poisoned".to_string()))?;
         if handle_guard.is_some() {
             // already running
             return Ok(());
@@ -54,7 +59,10 @@ impl ReaderBackend for PcscReaderBackend {
         self.set_status(ReaderStatus::Connecting);
 
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        *self.cancel.lock().expect("cancel lock") = Some(cancel_tx);
+        *self
+            .cancel
+            .lock()
+            .map_err(|_| ReaderError::Other("cancel lock poisoned".to_string()))? = Some(cancel_tx);
 
         let tx = self.tx.clone();
         let status = self.status.clone();
@@ -68,11 +76,20 @@ impl ReaderBackend for PcscReaderBackend {
     }
 
     async fn stop(&self) -> Result<(), ReaderError> {
-        if let Some(tx) = self.cancel.lock().expect("cancel lock").take() {
+        if let Some(tx) = self
+            .cancel
+            .lock()
+            .map_err(|_| ReaderError::Other("cancel lock poisoned".to_string()))?
+            .take()
+        {
             let _ = tx.send(true);
         }
         // MutexGuard を await 前にドロップするため take() だけここで行う
-        let handle = self.handle.lock().expect("handle lock").take();
+        let handle = self
+            .handle
+            .lock()
+            .map_err(|_| ReaderError::Other("handle lock poisoned".to_string()))?
+            .take();
         if let Some(h) = handle {
             let _ = h.await;
         }
@@ -81,7 +98,7 @@ impl ReaderBackend for PcscReaderBackend {
     }
 
     fn status(&self) -> ReaderStatus {
-        self.status.lock().expect("status lock").clone()
+        shared_status_snapshot(&self.status)
     }
 
     fn subscribe(&self) -> broadcast::Receiver<CardScanned> {
@@ -98,8 +115,10 @@ fn poll_loop(
     let ctx = match pcsc::Context::establish(pcsc::Scope::User) {
         Ok(ctx) => ctx,
         Err(e) => {
-            *status.lock().expect("status lock") =
-                ReaderStatus::Error(format!("PC/SC context error: {e}"));
+            let _ = set_shared_status(
+                &status,
+                ReaderStatus::Error(format!("PC/SC context error: {e}")),
+            );
             return;
         }
     };
@@ -117,7 +136,7 @@ fn poll_loop(
         let readers = match list_readers(&ctx) {
             Ok(r) => r,
             Err(e) => {
-                *status.lock().expect("status lock") = ReaderStatus::Error(e.clone());
+                let _ = set_shared_status(&status, ReaderStatus::Error(e.clone()));
                 tracing::warn!("PC/SC list readers failed: {e}");
                 std::thread::sleep(Duration::from_millis(1000));
                 continue;
@@ -125,14 +144,14 @@ fn poll_loop(
         };
 
         if readers.is_empty() {
-            *status.lock().expect("status lock") = ReaderStatus::Disconnected;
+            let _ = set_shared_status(&status, ReaderStatus::Disconnected);
             tracing::debug!("no PC/SC readers found, waiting...");
             std::thread::sleep(Duration::from_millis(1000));
             continue;
         }
 
         tracing::debug!(readers = ?readers, "PC/SC readers found");
-        *status.lock().expect("status lock") = ReaderStatus::Ready;
+        let _ = set_shared_status(&status, ReaderStatus::Ready);
 
         for reader_name in &readers {
             if *cancel.borrow() {
@@ -149,7 +168,17 @@ fn poll_loop(
 
                     if !suppress {
                         last_seen.insert(idm_hex.clone(), now_instant);
-                        let scanned_at = tokyo_now();
+                        let scanned_at = match tokyo_now() {
+                            Ok(scanned_at) => scanned_at,
+                            Err(error) => {
+                                let _ = set_shared_status(
+                                    &status,
+                                    ReaderStatus::Error(error.to_string()),
+                                );
+                                tracing::error!(%error, "failed to get Tokyo time for card scan");
+                                return;
+                            }
+                        };
                         tracing::info!(card_id = %idm_hex, "card scanned");
                         let _ = tx.send(CardScanned {
                             card_id: CardId(idm_hex),
@@ -219,8 +248,25 @@ fn read_card_id(ctx: &pcsc::Context, reader_name: &str) -> Result<Option<String>
     Ok(Some(hex))
 }
 
-fn tokyo_now() -> Zoned {
-    Timestamp::now().to_zoned(TimeZone::get("Asia/Tokyo").expect("Asia/Tokyo tz"))
+fn tokyo_now() -> Result<Zoned, ReaderError> {
+    let timezone = TimeZone::get("Asia/Tokyo")
+        .map_err(|error| ReaderError::Other(format!("Asia/Tokyo timezone unavailable: {error}")))?;
+    Ok(Timestamp::now().to_zoned(timezone))
+}
+
+fn set_shared_status(status: &Mutex<ReaderStatus>, next: ReaderStatus) -> Result<(), ReaderError> {
+    let mut guard = status
+        .lock()
+        .map_err(|_| ReaderError::Other("status lock poisoned".to_string()))?;
+    *guard = next;
+    Ok(())
+}
+
+fn shared_status_snapshot(status: &Mutex<ReaderStatus>) -> ReaderStatus {
+    match status.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => ReaderStatus::Error("status lock poisoned".to_string()),
+    }
 }
 
 /// 接続されている NFC リーダーを自動検出し、適切なバックエンドを返す。
@@ -262,6 +308,14 @@ pub fn detect_and_create() -> Result<Box<dyn ReaderBackend>, ReaderError> {
 mod tests {
     use super::PcscReaderBackend;
     use pasori_core::port::reader::{ReaderBackend, ReaderStatus};
+    use std::sync::Mutex;
+
+    fn poison_mutex<T>(mutex: &Mutex<T>) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mutex.lock().expect("test mutex lock should succeed");
+            panic!("poison mutex for test");
+        }));
+    }
 
     #[test]
     // 初期状態は Disconnected である。
@@ -275,5 +329,19 @@ mod tests {
     fn subscribe_returns_receiver() {
         let reader = PcscReaderBackend::new();
         let _rx = reader.subscribe();
+    }
+
+    #[test]
+    // status mutex が poison されても panic せず Error を返す。
+    fn status_returns_error_when_status_mutex_is_poisoned() {
+        let reader = PcscReaderBackend::new();
+        poison_mutex(&reader.status);
+
+        let status = reader.status();
+
+        assert_eq!(
+            status,
+            ReaderStatus::Error("status lock poisoned".to_string())
+        );
     }
 }

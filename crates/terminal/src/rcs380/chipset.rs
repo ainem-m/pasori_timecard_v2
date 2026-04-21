@@ -249,7 +249,9 @@ impl RCS380ReaderBackend {
     }
 
     fn set_status(&self, s: ReaderStatus) {
-        *self.status.lock().expect("status lock") = s;
+        if let Err(error) = set_shared_status(&self.status, s) {
+            tracing::error!(%error, "failed to update RCS380 reader status");
+        }
     }
 }
 
@@ -262,7 +264,10 @@ impl Default for RCS380ReaderBackend {
 #[async_trait::async_trait]
 impl ReaderBackend for RCS380ReaderBackend {
     async fn start(&self) -> Result<(), ReaderError> {
-        let mut handle_guard = self.handle.lock().expect("handle lock");
+        let mut handle_guard = self
+            .handle
+            .lock()
+            .map_err(|_| ReaderError::Other("handle lock poisoned".to_string()))?;
         if handle_guard.is_some() {
             return Ok(());
         }
@@ -270,7 +275,10 @@ impl ReaderBackend for RCS380ReaderBackend {
         self.set_status(ReaderStatus::Connecting);
 
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        *self.cancel.lock().expect("cancel lock") = Some(cancel_tx);
+        *self
+            .cancel
+            .lock()
+            .map_err(|_| ReaderError::Other("cancel lock poisoned".to_string()))? = Some(cancel_tx);
 
         let tx = self.tx.clone();
         let status = self.status.clone();
@@ -284,10 +292,19 @@ impl ReaderBackend for RCS380ReaderBackend {
     }
 
     async fn stop(&self) -> Result<(), ReaderError> {
-        if let Some(tx) = self.cancel.lock().expect("cancel lock").take() {
+        if let Some(tx) = self
+            .cancel
+            .lock()
+            .map_err(|_| ReaderError::Other("cancel lock poisoned".to_string()))?
+            .take()
+        {
             let _ = tx.send(true);
         }
-        let handle = self.handle.lock().expect("handle lock").take();
+        let handle = self
+            .handle
+            .lock()
+            .map_err(|_| ReaderError::Other("handle lock poisoned".to_string()))?
+            .take();
         if let Some(h) = handle {
             let _ = h.await;
         }
@@ -296,7 +313,7 @@ impl ReaderBackend for RCS380ReaderBackend {
     }
 
     fn status(&self) -> ReaderStatus {
-        self.status.lock().expect("status lock").clone()
+        shared_status_snapshot(&self.status)
     }
 
     fn subscribe(&self) -> broadcast::Receiver<CardScanned> {
@@ -312,8 +329,7 @@ fn poll_loop(
     let transport = match super::transport::UsbTransport::open() {
         Ok(t) => t,
         Err(e) => {
-            *status.lock().expect("status lock") =
-                ReaderStatus::Error(format!("USB open error: {e}"));
+            let _ = set_shared_status(&status, ReaderStatus::Error(format!("USB open error: {e}")));
             return;
         }
     };
@@ -321,12 +337,14 @@ fn poll_loop(
     let chipset = Chipset::new(transport);
 
     if let Err(e) = chipset.initialize() {
-        *status.lock().expect("status lock") =
-            ReaderStatus::Error(format!("initialize error: {e}"));
+        let _ = set_shared_status(
+            &status,
+            ReaderStatus::Error(format!("initialize error: {e}")),
+        );
         return;
     }
 
-    *status.lock().expect("status lock") = ReaderStatus::Ready;
+    let _ = set_shared_status(&status, ReaderStatus::Ready);
 
     let mut last_seen: HashMap<String, std::time::Instant> = HashMap::new();
     let mut poll_counter: u32 = 0;
@@ -361,7 +379,15 @@ fn poll_loop(
 
                 if !suppress {
                     last_seen.insert(idm_hex.clone(), now_instant);
-                    let scanned_at = tokyo_now();
+                    let scanned_at = match tokyo_now() {
+                        Ok(scanned_at) => scanned_at,
+                        Err(error) => {
+                            let _ =
+                                set_shared_status(&status, ReaderStatus::Error(error.to_string()));
+                            tracing::error!(%error, "failed to get Tokyo time for card scan");
+                            return;
+                        }
+                    };
                     tracing::info!(card_id = %idm_hex, "card scanned");
                     let _ = tx.send(CardScanned {
                         card_id: CardId(idm_hex),
@@ -379,14 +405,38 @@ fn poll_loop(
     let _ = chipset.shutdown();
 }
 
-fn tokyo_now() -> jiff::Zoned {
-    jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::get("Asia/Tokyo").expect("Asia/Tokyo tz"))
+fn tokyo_now() -> Result<jiff::Zoned, ReaderError> {
+    let timezone = jiff::tz::TimeZone::get("Asia/Tokyo")
+        .map_err(|error| ReaderError::Other(format!("Asia/Tokyo timezone unavailable: {error}")))?;
+    Ok(jiff::Timestamp::now().to_zoned(timezone))
+}
+
+fn set_shared_status(status: &Mutex<ReaderStatus>, next: ReaderStatus) -> Result<(), ReaderError> {
+    let mut guard = status
+        .lock()
+        .map_err(|_| ReaderError::Other("status lock poisoned".to_string()))?;
+    *guard = next;
+    Ok(())
+}
+
+fn shared_status_snapshot(status: &Mutex<ReaderStatus>) -> ReaderStatus {
+    match status.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => ReaderStatus::Error("status lock poisoned".to_string()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rcs380::transport::MockTransport;
+
+    fn poison_mutex<T>(mutex: &Mutex<T>) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mutex.lock().expect("test mutex lock should succeed");
+            panic!("poison mutex for test");
+        }));
+    }
 
     #[test]
     // 初期状態は Disconnected である。
@@ -400,6 +450,20 @@ mod tests {
     fn subscribe_returns_receiver() {
         let reader = RCS380ReaderBackend::new();
         let _rx = reader.subscribe();
+    }
+
+    #[test]
+    // status mutex が poison されても panic せず Error を返す。
+    fn status_returns_error_when_status_mutex_is_poisoned() {
+        let reader = RCS380ReaderBackend::new();
+        poison_mutex(&reader.status);
+
+        let status = reader.status();
+
+        assert_eq!(
+            status,
+            ReaderStatus::Error("status lock poisoned".to_string())
+        );
     }
 
     fn queue_command_response(transport: &MockTransport, response_payload: &[u8]) {
