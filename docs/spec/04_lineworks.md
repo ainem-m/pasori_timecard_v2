@@ -165,3 +165,14 @@ fn verify_signature(body: &[u8], signature: &str, secret: &[u8]) -> bool {
 - コマンドパーサ (proptest: 任意の入力で panic しない、不明コマンドは「ヘルプ」誘導)
 - 承認ルール判定
 - 状態遷移 (不正遷移を弾く)
+
+## 実装確認メモ
+
+- 2026-04-21 時点の公式ソース照合メモは
+  [docs/archive/2026-04-21-lineworks-official-source-check.md](../archive/2026-04-21-lineworks-official-source-check.md)
+  を参照
+- セットアップ / 運用手順は
+  [docs/archive/2026-04-21-bitwarden-lineworks-setup-runbook.md](../archive/2026-04-21-bitwarden-lineworks-setup-runbook.md)
+  を参照
+- `developers.worksmobile.com` の API リファレンス本文を直接確認できていない箇所は、
+  実装前に公式サンプルまたは公式リファレンスで再照合すること

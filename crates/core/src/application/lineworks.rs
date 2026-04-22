@@ -151,8 +151,7 @@ impl LineworksUseCase {
             }
             LineworksCommand::TodayAttendance => {
                 let today = requested_at.date();
-                let from =
-                    day_start_in_tokyo(today).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let from = day_start_in_tokyo(today).map_err(|e| anyhow::anyhow!("{e}"))?;
                 let to = day_end_in_tokyo(today).map_err(|e| anyhow::anyhow!("{e}"))?;
                 let punches: Vec<crate::domain::punch::PunchEvent> = self
                     .punch_repo
@@ -184,16 +183,14 @@ impl LineworksUseCase {
                 let today = requested_at.date();
                 let year_month = YearMonth::new(today.year(), today.month())
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                let cutoff_rule = CutoffRule::DayOfMonth(
-                    CutoffDay::new(15).map_err(|e| anyhow::anyhow!("{e}"))?,
-                );
+                let cutoff_rule =
+                    CutoffRule::DayOfMonth(CutoffDay::new(15).map_err(|e| anyhow::anyhow!("{e}"))?);
                 let period = year_month
                     .attendance_period(cutoff_rule)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                let from = day_start_in_tokyo(period.period_start)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                let to =
-                    day_end_in_tokyo(period.period_end).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let from =
+                    day_start_in_tokyo(period.period_start).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let to = day_end_in_tokyo(period.period_end).map_err(|e| anyhow::anyhow!("{e}"))?;
                 let punches = self
                     .punch_repo
                     .list_in_range(account.employee_id, &from, &to)
@@ -246,6 +243,7 @@ impl LineworksUseCase {
                         employee_id: account.employee_id,
                         request_type,
                         requested_payload_json: payload.to_string(),
+                        status,
                         requested_via: AttendanceRequestSource::LineWorks,
                         requested_at: requested_at.clone(),
                     })
@@ -335,12 +333,73 @@ impl LineworksUseCase {
                     })
                     .await?;
             }
-            LineworksCommand::Correction { .. } => {
-                // TODO: 月次勤怠集計・修正申請の承認フローを実装
+            LineworksCommand::Correction { date, target, time } => {
+                let from = day_start_in_tokyo(date).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let to = day_end_in_tokyo(date).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let punches = self
+                    .punch_repo
+                    .list_in_range(account.employee_id, &from, &to)
+                    .await?;
+                let correction_delta_minutes =
+                    calculate_correction_delta_minutes(&punches, target, time, &from);
+                let status = decide_lineworks_request_status(
+                    &command,
+                    requested_at,
+                    false, // TODO: check period lock
+                    120,   // TODO: settings
+                    correction_delta_minutes,
+                )
+                .unwrap_or(AttendanceRequestStatus::Requested);
+
+                let payload = serde_json::json!({
+                    "command": format!("{:?}", command),
+                    "date": date.to_string(),
+                    "target": match target {
+                        CorrectionTarget::ClockIn => "clock_in",
+                        CorrectionTarget::ClockOut => "clock_out",
+                    },
+                    "time": format!("{:02}:{:02}", time.hour(), time.minute()),
+                });
+
+                let request = self
+                    .request_repo
+                    .create(NewAttendanceRequest {
+                        employee_id: account.employee_id,
+                        request_type: AttendanceRequestType::Correction,
+                        requested_payload_json: payload.to_string(),
+                        status,
+                        requested_via: AttendanceRequestSource::LineWorks,
+                        requested_at: requested_at.clone(),
+                    })
+                    .await?;
+
+                if status == AttendanceRequestStatus::AutoApproved {
+                    let applied_punch_id = apply_correction_to_punch_repo(
+                        self.punch_repo.as_ref(),
+                        &punches,
+                        target,
+                        time,
+                    )
+                    .await?;
+                    self.request_repo
+                        .update_status(
+                            request.id,
+                            AttendanceRequestStatus::Applied,
+                            Some(applied_punch_id),
+                        )
+                        .await?;
+                }
+
+                let response_text = if status == AttendanceRequestStatus::AutoApproved {
+                    "修正申請を自動承認し、反映しました。".to_string()
+                } else {
+                    "修正申請を受け付けました。管理者の承認をお待ちください。".to_string()
+                };
+
                 self.notifier
                     .notify(NotifyEvent::LineworksResponse {
                         user_id: external_user_id.to_string(),
-                        text: "申し訳ありません。そのコマンドは現在準備中です。".to_string(),
+                        text: response_text,
                     })
                     .await?;
             }
@@ -360,7 +419,10 @@ fn build_lineworks_monthly_timesheet(
         std::collections::BTreeMap::new();
 
     for punch in punches {
-        grouped.entry(punch.occurred_at.date()).or_default().push(punch);
+        grouped
+            .entry(punch.occurred_at.date())
+            .or_default()
+            .push(punch);
     }
 
     let days = grouped
@@ -391,6 +453,70 @@ fn format_work_minutes(total_minutes: i64) -> String {
     let hours = total_minutes / 60;
     let minutes = total_minutes % 60;
     format!("{hours}時間{minutes}分")
+}
+
+async fn apply_correction_to_punch_repo(
+    punch_repo: &dyn PunchRepository,
+    punches: &[crate::domain::punch::PunchEvent],
+    target: CorrectionTarget,
+    time: ClockTime,
+) -> anyhow::Result<uuid::Uuid> {
+    let target_event_type = match target {
+        CorrectionTarget::ClockIn => crate::port::policy::PunchEventType::ClockIn,
+        CorrectionTarget::ClockOut => crate::port::policy::PunchEventType::ClockOut,
+    };
+
+    let existing = punches
+        .iter()
+        .find(|punch| punch.event_type == target_event_type)
+        .ok_or_else(|| anyhow::anyhow!("target punch not found for correction"))?;
+    let corrected_at = build_corrected_time(&existing.occurred_at, time)?;
+    let updated = punch_repo
+        .update(
+            existing.id,
+            crate::domain::punch::PunchPatch {
+                event_type: Some(target_event_type),
+                occurred_at: Some(corrected_at),
+            },
+            "lineworks correction".to_string(),
+        )
+        .await?;
+
+    Ok(updated.id)
+}
+
+fn build_corrected_time(base: &Zoned, time: ClockTime) -> anyhow::Result<Zoned> {
+    base.date()
+        .at(
+            i8::try_from(time.hour()).map_err(|e| anyhow::anyhow!("{e}"))?,
+            i8::try_from(time.minute()).map_err(|e| anyhow::anyhow!("{e}"))?,
+            0,
+            0,
+        )
+        .in_tz("Asia/Tokyo")
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn calculate_correction_delta_minutes(
+    punches: &[crate::domain::punch::PunchEvent],
+    target: CorrectionTarget,
+    time: ClockTime,
+    fallback_day_start: &Zoned,
+) -> Option<i64> {
+    let target_event_type = match target {
+        CorrectionTarget::ClockIn => crate::port::policy::PunchEventType::ClockIn,
+        CorrectionTarget::ClockOut => crate::port::policy::PunchEventType::ClockOut,
+    };
+
+    let requested_minutes = i64::from(time.hour()) * 60 + i64::from(time.minute());
+    let reference = punches
+        .iter()
+        .find(|punch| punch.event_type == target_event_type)
+        .map(|punch| punch.occurred_at.clone())
+        .unwrap_or_else(|| fallback_day_start.clone());
+    let reference_minutes = i64::from(reference.hour()) * 60 + i64::from(reference.minute());
+
+    Some((requested_minutes - reference_minutes).abs())
 }
 
 pub fn decide_lineworks_request_status(
@@ -581,8 +707,18 @@ mod tests {
     // 紐付けられていないユーザーからのコマンドには、登録を促す返信をする。
     async fn responds_with_unbound_message_when_user_not_found() {
         let external_repo = Arc::new(MockExternalRepo { account: None });
-        let request_repo = Arc::new(MockRequestRepo);
-        let punch_repo = Arc::new(MockPunchRepo { punches: vec![] });
+        let request_repo = Arc::new(MockRequestRepo::default());
+        let punch_repo = Arc::new(MockPunchRepo {
+            punches: vec![sample_punch(
+                crate::port::policy::PunchEventType::ClockIn,
+                2026,
+                4,
+                16,
+                9,
+                0,
+            )],
+            ..Default::default()
+        });
         let shift_repo = Arc::new(MockShiftRepo);
         let notifier = Arc::new(MockNotifier::default());
 
@@ -630,7 +766,7 @@ mod tests {
                 updated_at: tokyo_datetime(2026, 4, 16, 0, 0),
             }),
         });
-        let request_repo = Arc::new(MockRequestRepo);
+        let request_repo = Arc::new(MockRequestRepo::default());
         let punch_repo = Arc::new(MockPunchRepo {
             punches: vec![sample_punch(
                 crate::port::policy::PunchEventType::ClockIn,
@@ -640,6 +776,7 @@ mod tests {
                 9,
                 0,
             )],
+            ..Default::default()
         });
         let shift_repo = Arc::new(MockShiftRepo);
         let notifier = Arc::new(MockNotifier::default());
@@ -689,15 +826,51 @@ mod tests {
                 updated_at: tokyo_datetime(2026, 4, 16, 0, 0),
             }),
         });
-        let request_repo = Arc::new(MockRequestRepo);
+        let request_repo = Arc::new(MockRequestRepo::default());
         let punch_repo = Arc::new(MockPunchRepo {
             punches: vec![
-                sample_punch(crate::port::policy::PunchEventType::ClockIn, 2026, 3, 16, 9, 0),
-                sample_punch(crate::port::policy::PunchEventType::ClockOut, 2026, 3, 16, 18, 0),
-                sample_punch(crate::port::policy::PunchEventType::ClockIn, 2026, 4, 15, 9, 30),
-                sample_punch(crate::port::policy::PunchEventType::ClockOut, 2026, 4, 15, 18, 0),
-                sample_punch(crate::port::policy::PunchEventType::ClockIn, 2026, 4, 16, 9, 0),
+                sample_punch(
+                    crate::port::policy::PunchEventType::ClockIn,
+                    2026,
+                    3,
+                    16,
+                    9,
+                    0,
+                ),
+                sample_punch(
+                    crate::port::policy::PunchEventType::ClockOut,
+                    2026,
+                    3,
+                    16,
+                    18,
+                    0,
+                ),
+                sample_punch(
+                    crate::port::policy::PunchEventType::ClockIn,
+                    2026,
+                    4,
+                    15,
+                    9,
+                    30,
+                ),
+                sample_punch(
+                    crate::port::policy::PunchEventType::ClockOut,
+                    2026,
+                    4,
+                    15,
+                    18,
+                    0,
+                ),
+                sample_punch(
+                    crate::port::policy::PunchEventType::ClockIn,
+                    2026,
+                    4,
+                    16,
+                    9,
+                    0,
+                ),
             ],
+            ..Default::default()
         });
         let shift_repo = Arc::new(MockShiftRepo);
         let notifier = Arc::new(MockNotifier::default());
@@ -712,7 +885,11 @@ mod tests {
 
         let requested_at = tokyo_datetime(2026, 4, 16, 10, 0);
         use_case
-            .process_event("user-1", super::LineworksCommand::MonthAttendance, &requested_at)
+            .process_event(
+                "user-1",
+                super::LineworksCommand::MonthAttendance,
+                &requested_at,
+            )
             .await
             .expect("should process");
 
@@ -723,6 +900,185 @@ mod tests {
             assert!(text.contains("【今月の勤怠】"));
             assert!(text.contains("期間: 2026-03-16 - 2026-04-15"));
             assert!(text.contains("勤務時間合計: 17時間30分"));
+        } else {
+            panic!("unexpected notify event");
+        }
+    }
+
+    #[tokio::test]
+    // 当日軽微修正は自動承認として申請を保存し、その旨を返信する。
+    async fn auto_approves_same_day_correction_request() {
+        let employee_id = uuid::Uuid::now_v7();
+        let external_repo = Arc::new(MockExternalRepo {
+            account: Some(crate::domain::employee::ExternalAccount {
+                id: uuid::Uuid::now_v7(),
+                employee_id,
+                provider: "lineworks".to_string(),
+                external_user_id: "user-1".to_string(),
+                external_domain_id: None,
+                is_verified: true,
+                created_at: tokyo_datetime(2026, 4, 16, 0, 0),
+                updated_at: tokyo_datetime(2026, 4, 16, 0, 0),
+            }),
+        });
+        let request_repo = Arc::new(MockRequestRepo::default());
+        let punch_repo = Arc::new(MockPunchRepo {
+            punches: vec![sample_punch(
+                crate::port::policy::PunchEventType::ClockIn,
+                2026,
+                4,
+                16,
+                9,
+                0,
+            )],
+            ..Default::default()
+        });
+        let shift_repo = Arc::new(MockShiftRepo);
+        let notifier = Arc::new(MockNotifier::default());
+
+        let use_case = super::LineworksUseCase::new(
+            external_repo,
+            request_repo.clone(),
+            punch_repo.clone(),
+            shift_repo,
+            notifier.clone(),
+        );
+
+        let requested_at = tokyo_datetime(2026, 4, 16, 10, 0);
+        use_case
+            .process_event(
+                "user-1",
+                super::LineworksCommand::Correction {
+                    date: date(2026, 4, 16),
+                    target: super::CorrectionTarget::ClockIn,
+                    time: super::ClockTime::new(8, 32).expect("valid time"),
+                },
+                &requested_at,
+            )
+            .await
+            .expect("should process");
+
+        let requests = request_repo.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].request_type,
+            crate::domain::request::AttendanceRequestType::Correction
+        );
+        assert_eq!(
+            requests[0].created_status,
+            crate::domain::request::AttendanceRequestStatus::AutoApproved
+        );
+        assert!(
+            requests[0]
+                .requested_payload_json
+                .contains("\"date\":\"2026-04-16\"")
+        );
+        assert!(
+            requests[0]
+                .requested_payload_json
+                .contains("\"target\":\"clock_in\"")
+        );
+
+        let transitions = request_repo.transitions.lock().await;
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(
+            transitions[0].status,
+            crate::domain::request::AttendanceRequestStatus::Applied
+        );
+        assert!(transitions[0].applied_event_id.is_some());
+
+        let updates = punch_repo.updates.lock().await;
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0]
+                .patch
+                .occurred_at
+                .as_ref()
+                .map(|z| z.strftime("%H:%M").to_string()),
+            Some("08:32".to_string())
+        );
+
+        let events = notifier.events.lock().await;
+        assert_eq!(events.len(), 1);
+        if let crate::port::notify::NotifyEvent::LineworksResponse { text, .. } = &events[0] {
+            assert!(text.contains("修正申請を自動承認し、反映しました。"));
+        } else {
+            panic!("unexpected notify event");
+        }
+    }
+
+    #[tokio::test]
+    // 過去日修正は requested 状態で保存し、管理者承認待ちにする。
+    async fn queues_past_day_correction_for_admin_review() {
+        let employee_id = uuid::Uuid::now_v7();
+        let external_repo = Arc::new(MockExternalRepo {
+            account: Some(crate::domain::employee::ExternalAccount {
+                id: uuid::Uuid::now_v7(),
+                employee_id,
+                provider: "lineworks".to_string(),
+                external_user_id: "user-1".to_string(),
+                external_domain_id: None,
+                is_verified: true,
+                created_at: tokyo_datetime(2026, 4, 16, 0, 0),
+                updated_at: tokyo_datetime(2026, 4, 16, 0, 0),
+            }),
+        });
+        let request_repo = Arc::new(MockRequestRepo::default());
+        let punch_repo = Arc::new(MockPunchRepo {
+            punches: vec![sample_punch(
+                crate::port::policy::PunchEventType::ClockOut,
+                2026,
+                4,
+                15,
+                18,
+                0,
+            )],
+            ..Default::default()
+        });
+        let shift_repo = Arc::new(MockShiftRepo);
+        let notifier = Arc::new(MockNotifier::default());
+
+        let use_case = super::LineworksUseCase::new(
+            external_repo,
+            request_repo.clone(),
+            punch_repo.clone(),
+            shift_repo,
+            notifier.clone(),
+        );
+
+        let requested_at = tokyo_datetime(2026, 4, 16, 10, 0);
+        use_case
+            .process_event(
+                "user-1",
+                super::LineworksCommand::Correction {
+                    date: date(2026, 4, 15),
+                    target: super::CorrectionTarget::ClockOut,
+                    time: super::ClockTime::new(18, 5).expect("valid time"),
+                },
+                &requested_at,
+            )
+            .await
+            .expect("should process");
+
+        let requests = request_repo.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].created_status,
+            crate::domain::request::AttendanceRequestStatus::Requested
+        );
+        assert!(
+            requests[0]
+                .requested_payload_json
+                .contains("\"target\":\"clock_out\"")
+        );
+
+        let transitions = request_repo.transitions.lock().await;
+        assert_eq!(transitions.len(), 0);
+
+        let events = notifier.events.lock().await;
+        assert_eq!(events.len(), 1);
+        if let crate::port::notify::NotifyEvent::LineworksResponse { text, .. } = &events[0] {
+            assert!(text.contains("修正申請を受け付けました。管理者の承認をお待ちください。"));
         } else {
             panic!("unexpected notify event");
         }
@@ -770,23 +1126,44 @@ mod tests {
         }
     }
 
-    struct MockRequestRepo;
+    #[derive(Default)]
+    struct MockRequestRepo {
+        requests: Mutex<Vec<RecordedRequest>>,
+        transitions: Mutex<Vec<RecordedTransition>>,
+    }
+
+    struct RecordedRequest {
+        request_type: crate::domain::request::AttendanceRequestType,
+        requested_payload_json: String,
+        created_status: crate::domain::request::AttendanceRequestStatus,
+    }
+
+    struct RecordedTransition {
+        status: crate::domain::request::AttendanceRequestStatus,
+        applied_event_id: Option<uuid::Uuid>,
+    }
+
     #[async_trait::async_trait]
     impl crate::port::repo::AttendanceRequestRepository for MockRequestRepo {
         async fn create(
             &self,
-            _: crate::domain::request::NewAttendanceRequest,
+            input: crate::domain::request::NewAttendanceRequest,
         ) -> Result<crate::domain::request::AttendanceRequest, crate::port::repo::RepoError>
         {
+            self.requests.lock().await.push(RecordedRequest {
+                request_type: input.request_type,
+                requested_payload_json: input.requested_payload_json.clone(),
+                created_status: input.status,
+            });
+
             Ok(crate::domain::request::AttendanceRequest {
                 id: uuid::Uuid::now_v7(),
-                employee_id: uuid::Uuid::now_v7(),
-                request_type: crate::domain::request::AttendanceRequestType::MissingIn,
-                requested_payload_json: "{}".to_string(),
-                status: crate::domain::request::AttendanceRequestStatus::Requested,
-                requested_via: crate::domain::request::AttendanceRequestSource::LineWorks,
-                requested_at: jiff::Timestamp::now()
-                    .to_zoned(jiff::tz::TimeZone::get("Asia/Tokyo").unwrap()),
+                employee_id: input.employee_id,
+                request_type: input.request_type,
+                requested_payload_json: input.requested_payload_json,
+                status: input.status,
+                requested_via: input.requested_via,
+                requested_at: input.requested_at,
                 reviewed_by_admin_user_id: None,
                 reviewed_at: None,
                 review_note: None,
@@ -800,10 +1177,44 @@ mod tests {
         {
             unimplemented!()
         }
+
+        async fn update_status(
+            &self,
+            id: uuid::Uuid,
+            status: crate::domain::request::AttendanceRequestStatus,
+            applied_event_id: Option<uuid::Uuid>,
+        ) -> Result<crate::domain::request::AttendanceRequest, crate::port::repo::RepoError>
+        {
+            self.transitions.lock().await.push(RecordedTransition {
+                status,
+                applied_event_id,
+            });
+
+            Ok(crate::domain::request::AttendanceRequest {
+                id,
+                employee_id: uuid::Uuid::now_v7(),
+                request_type: crate::domain::request::AttendanceRequestType::Correction,
+                requested_payload_json: "{}".to_string(),
+                status,
+                requested_via: crate::domain::request::AttendanceRequestSource::LineWorks,
+                requested_at: jiff::Timestamp::now()
+                    .to_zoned(jiff::tz::TimeZone::get("Asia/Tokyo").unwrap()),
+                reviewed_by_admin_user_id: None,
+                reviewed_at: None,
+                review_note: None,
+                applied_event_id,
+            })
+        }
     }
 
+    #[derive(Default)]
     struct MockPunchRepo {
         punches: Vec<crate::domain::punch::PunchEvent>,
+        updates: Mutex<Vec<RecordedPunchUpdate>>,
+    }
+
+    struct RecordedPunchUpdate {
+        patch: crate::domain::punch::PunchPatch,
     }
     #[async_trait::async_trait]
     impl crate::port::repo::PunchRepository for MockPunchRepo {
@@ -835,11 +1246,28 @@ mod tests {
         }
         async fn update(
             &self,
-            _: uuid::Uuid,
-            _: crate::domain::punch::PunchPatch,
+            id: uuid::Uuid,
+            patch: crate::domain::punch::PunchPatch,
             _: String,
         ) -> Result<crate::domain::punch::PunchEvent, crate::port::repo::RepoError> {
-            unimplemented!()
+            self.updates.lock().await.push(RecordedPunchUpdate {
+                patch: patch.clone(),
+            });
+
+            let original = self
+                .punches
+                .iter()
+                .find(|punch| punch.id == id)
+                .cloned()
+                .ok_or(crate::port::repo::RepoError::NotFound)?;
+
+            Ok(crate::domain::punch::PunchEvent {
+                event_type: patch.event_type.unwrap_or(original.event_type),
+                occurred_at: patch.occurred_at.unwrap_or(original.occurred_at.clone()),
+                correction_reason: Some("lineworks correction".to_string()),
+                updated_at: tokyo_datetime(2026, 4, 16, 10, 0),
+                ..original
+            })
         }
         async fn soft_delete(
             &self,

@@ -4133,6 +4133,7 @@ dependencies = [
  "jiff",
  "mime_guess",
  "pasori-core",
+ "rand 0.8.5",
  "reqwest 0.12.28",
  "rust-embed",
  "serde",

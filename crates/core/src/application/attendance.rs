@@ -245,7 +245,7 @@ pub fn decide_attendance_request_status(
             {
                 AttendanceRequestStatus::AutoApproved
             } else {
-                AttendanceRequestStatus::Approved
+                AttendanceRequestStatus::Requested
             }
         }
     }
@@ -451,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    // 当日中でも軽微修正の閾値を超える場合は管理者承認に回す。
+    // 当日中でも軽微修正の閾値を超える場合は承認待ちで保留する。
     fn sends_large_same_day_correction_to_manual_review() {
         let requested_at = tokyo_datetime(2026, 4, 16, 10, 0);
 
@@ -464,7 +464,7 @@ mod tests {
             Some(181),
         );
 
-        assert_eq!(status, AttendanceRequestStatus::Approved);
+        assert_eq!(status, AttendanceRequestStatus::Requested);
     }
 
     #[test]

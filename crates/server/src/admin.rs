@@ -1,17 +1,30 @@
 use crate::infra::sqlite::{AdminAuthenticationResult, AuthenticatedAdmin, SqliteRepository};
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHasher, SaltString},
+};
 use axum::{
     Json, Router,
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
+use base64::Engine;
 use pasori_core::domain::audit::NewAuditLog;
 use pasori_core::domain::employee::{EmployeePatch, NewEmployee};
-use pasori_core::domain::punch::{AttendanceDay, AttendanceDayStatus, PunchEvent};
+use pasori_core::domain::punch::{AttendanceDay, AttendanceDayStatus, PunchEvent, PunchPatch};
+use pasori_core::domain::request::{
+    AttendanceRequest, AttendanceRequestStatus, AttendanceRequestType,
+};
 use pasori_core::domain::time::{CutoffDay, CutoffRule, MonthlyTimesheet, YearMonth};
 use pasori_core::port::policy::NoRounding;
-use pasori_core::port::repo::{AuditLogRepository, EmployeeRepository, PunchRepository};
+use pasori_core::port::policy::PunchEventType;
+use pasori_core::port::repo::{
+    AttendanceRequestRepository, AuditLogRepository, EmployeeRepository, PunchRepository, RepoError,
+};
+use rand::{RngCore, rngs::OsRng};
+use serde::Deserialize;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -33,6 +46,24 @@ pub fn router(repo: Arc<SqliteRepository>) -> Router {
             get(get_employee)
                 .put(update_employee)
                 .delete(deactivate_employee),
+        )
+        .route(
+            "/admin/terminals",
+            get(list_terminals).post(create_terminal),
+        )
+        .route("/admin/terminals/:id", delete(deactivate_terminal))
+        .route(
+            "/admin/terminals/:id/rotate_token",
+            post(rotate_terminal_token),
+        )
+        .route("/admin/attendance_requests", get(list_attendance_requests))
+        .route(
+            "/admin/attendance_requests/:id/approve",
+            post(approve_attendance_request),
+        )
+        .route(
+            "/admin/attendance_requests/:id/reject",
+            post(reject_attendance_request),
         )
         .route("/admin/attendance/monthly", get(get_monthly_attendance))
         .route("/admin/punches", get(list_punches))
@@ -56,6 +87,33 @@ struct MonthlyAttendanceQuery {
     employee_id: Uuid,
     year: i16,
     month: i8,
+}
+
+#[derive(serde::Deserialize)]
+struct AttendanceRequestListQuery {
+    status: Option<AttendanceRequestStatus>,
+}
+
+#[derive(Deserialize)]
+struct AttendanceRequestReviewInput {
+    review_note: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateTerminalRequest {
+    name: String,
+}
+
+#[derive(serde::Serialize)]
+struct CreateTerminalResponse {
+    terminal: crate::infra::sqlite::TerminalRecord,
+    api_token: String,
+}
+
+#[derive(serde::Serialize)]
+struct RotateTerminalTokenResponse {
+    terminal: crate::infra::sqlite::TerminalRecord,
+    api_token: String,
 }
 
 #[derive(serde::Serialize)]
@@ -244,7 +302,7 @@ async fn create_employee(
         Err(status) => return Err(status),
     };
 
-    match state.repo.create(input).await {
+    match EmployeeRepository::create(&*state.repo, input).await {
         Ok(employee) => Ok((StatusCode::CREATED, Json(employee))),
         Err(e) => {
             tracing::error!(error = ?e, "create_employee error");
@@ -263,7 +321,7 @@ async fn get_employee(
         Err(status) => return Err(status),
     };
 
-    match state.repo.find(id).await {
+    match EmployeeRepository::find(&*state.repo, id).await {
         Ok(Some(employee)) => Ok(Json(employee)),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
@@ -327,6 +385,150 @@ async fn list_punches(
     }
 }
 
+async fn list_terminals(
+    headers: HeaderMap,
+    State(state): State<AdminAppState>,
+) -> Result<Json<Vec<crate::infra::sqlite::TerminalRecord>>, StatusCode> {
+    let _admin = authenticate_admin_request(&state, &headers).await?;
+
+    match state.repo.list_terminals().await {
+        Ok(terminals) => Ok(Json(terminals)),
+        Err(e) => {
+            tracing::error!(error = ?e, "list_terminals error");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn create_terminal(
+    headers: HeaderMap,
+    State(state): State<AdminAppState>,
+    Json(input): Json<CreateTerminalRequest>,
+) -> Result<(StatusCode, Json<CreateTerminalResponse>), StatusCode> {
+    let admin = authenticate_admin_request(&state, &headers).await?;
+    let api_token = generate_terminal_api_token();
+    let api_token_hash =
+        hash_terminal_token(&api_token).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let terminal = state
+        .repo
+        .create_terminal(&input.name, &api_token_hash)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let _ = state
+        .repo
+        .append(NewAuditLog {
+            actor_type: "admin".to_string(),
+            actor_id: Some(admin.id.to_string()),
+            action: "terminal.registered".to_string(),
+            target_type: "terminal".to_string(),
+            target_id: Some(terminal.id.to_string()),
+            before_json: None,
+            after_json: serde_json::to_string(&terminal).ok(),
+            metadata_json: Some(
+                serde_json::json!({
+                    "name": terminal.name,
+                })
+                .to_string(),
+            ),
+        })
+        .await;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateTerminalResponse {
+            terminal,
+            api_token,
+        }),
+    ))
+}
+
+async fn rotate_terminal_token(
+    headers: HeaderMap,
+    State(state): State<AdminAppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<RotateTerminalTokenResponse>, StatusCode> {
+    let admin = authenticate_admin_request(&state, &headers).await?;
+    let before = state
+        .repo
+        .find_terminal(id)
+        .await
+        .map_err(repo_error_to_status)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let api_token = generate_terminal_api_token();
+    let api_token_hash =
+        hash_terminal_token(&api_token).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let terminal = state
+        .repo
+        .rotate_terminal_token(id, &api_token_hash)
+        .await
+        .map_err(repo_error_to_status)?;
+
+    let _ = state
+        .repo
+        .append(NewAuditLog {
+            actor_type: "admin".to_string(),
+            actor_id: Some(admin.id.to_string()),
+            action: "terminal.token_rotated".to_string(),
+            target_type: "terminal".to_string(),
+            target_id: Some(terminal.id.to_string()),
+            before_json: serde_json::to_string(&before).ok(),
+            after_json: serde_json::to_string(&terminal).ok(),
+            metadata_json: Some(
+                serde_json::json!({
+                    "name": terminal.name,
+                })
+                .to_string(),
+            ),
+        })
+        .await;
+
+    Ok(Json(RotateTerminalTokenResponse {
+        terminal,
+        api_token,
+    }))
+}
+
+async fn deactivate_terminal(
+    headers: HeaderMap,
+    State(state): State<AdminAppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, StatusCode> {
+    let admin = authenticate_admin_request(&state, &headers).await?;
+    let before = state
+        .repo
+        .find_terminal(id)
+        .await
+        .map_err(repo_error_to_status)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let terminal = state
+        .repo
+        .deactivate_terminal(id)
+        .await
+        .map_err(repo_error_to_status)?;
+
+    let _ = state
+        .repo
+        .append(NewAuditLog {
+            actor_type: "admin".to_string(),
+            actor_id: Some(admin.id.to_string()),
+            action: "terminal.deactivated".to_string(),
+            target_type: "terminal".to_string(),
+            target_id: Some(terminal.id.to_string()),
+            before_json: serde_json::to_string(&before).ok(),
+            after_json: serde_json::to_string(&terminal).ok(),
+            metadata_json: Some(
+                serde_json::json!({
+                    "name": terminal.name,
+                })
+                .to_string(),
+            ),
+        })
+        .await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn get_monthly_attendance(
     headers: HeaderMap,
     State(state): State<AdminAppState>,
@@ -336,13 +538,13 @@ async fn get_monthly_attendance(
 
     let year_month =
         YearMonth::new(query.year, query.month).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let cutoff_rule = CutoffRule::DayOfMonth(
-        CutoffDay::new(15).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-    );
+    let cutoff_rule =
+        CutoffRule::DayOfMonth(CutoffDay::new(15).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
     let period = year_month
         .attendance_period(cutoff_rule)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let from = day_start_in_tokyo(period.period_start).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let from =
+        day_start_in_tokyo(period.period_start).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let to = day_end_in_tokyo(period.period_end).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let punches = state
         .repo
@@ -354,6 +556,113 @@ async fn get_monthly_attendance(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(to_monthly_attendance_response(timesheet)))
+}
+
+async fn list_attendance_requests(
+    headers: HeaderMap,
+    State(state): State<AdminAppState>,
+    axum::extract::Query(query): axum::extract::Query<AttendanceRequestListQuery>,
+) -> Result<Json<Vec<AttendanceRequest>>, StatusCode> {
+    let _admin = authenticate_admin_request(&state, &headers).await?;
+
+    state
+        .repo
+        .list_attendance_requests(query.status)
+        .await
+        .map(Json)
+        .map_err(repo_error_to_status)
+}
+
+async fn approve_attendance_request(
+    headers: HeaderMap,
+    State(state): State<AdminAppState>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<AttendanceRequestReviewInput>,
+) -> Result<Json<AttendanceRequest>, StatusCode> {
+    let admin = authenticate_admin_request(&state, &headers).await?;
+    let request = AttendanceRequestRepository::find(&*state.repo, id)
+        .await
+        .map_err(repo_error_to_status)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    if request.request_type != AttendanceRequestType::Correction {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    let reviewed = state
+        .repo
+        .review_attendance_request(
+            id,
+            admin.id,
+            AttendanceRequestStatus::Approved,
+            input.review_note.clone(),
+        )
+        .await
+        .map_err(repo_error_to_status)?;
+
+    let (before_punch, updated_punch) = apply_correction_request(&state.repo, &request).await?;
+    let applied = AttendanceRequestRepository::update_status(
+        &*state.repo,
+        id,
+        AttendanceRequestStatus::Applied,
+        Some(updated_punch.id),
+    )
+    .await
+    .map_err(repo_error_to_status)?;
+
+    append_attendance_request_audit(
+        &state,
+        &admin,
+        "request.approved",
+        &request,
+        &reviewed,
+        serde_json::json!({
+            "review_note": input.review_note,
+            "applied_event_id": updated_punch.id,
+        }),
+    )
+    .await;
+    append_punch_update_audit(&state, &admin, &before_punch, &updated_punch, id).await;
+
+    Ok(Json(applied))
+}
+
+async fn reject_attendance_request(
+    headers: HeaderMap,
+    State(state): State<AdminAppState>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<AttendanceRequestReviewInput>,
+) -> Result<Json<AttendanceRequest>, StatusCode> {
+    let admin = authenticate_admin_request(&state, &headers).await?;
+    let request = AttendanceRequestRepository::find(&*state.repo, id)
+        .await
+        .map_err(repo_error_to_status)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let rejected = state
+        .repo
+        .review_attendance_request(
+            id,
+            admin.id,
+            AttendanceRequestStatus::Rejected,
+            input.review_note.clone(),
+        )
+        .await
+        .map_err(repo_error_to_status)?;
+
+    append_attendance_request_audit(
+        &state,
+        &admin,
+        "request.rejected",
+        &request,
+        &rejected,
+        serde_json::json!({
+            "review_note": input.review_note,
+        }),
+    )
+    .await;
+
+    Ok(Json(rejected))
 }
 
 async fn list_audit_logs(
@@ -386,6 +695,14 @@ async fn authenticate_admin_request(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::UNAUTHORIZED)
+}
+
+fn repo_error_to_status(error: RepoError) -> StatusCode {
+    match error {
+        RepoError::NotFound => StatusCode::NOT_FOUND,
+        RepoError::Conflict(_) => StatusCode::CONFLICT,
+        RepoError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 fn extract_admin_session_cookie(headers: &HeaderMap) -> Option<&str> {
@@ -462,6 +779,143 @@ fn merge_login_metadata(base_json: String, extra: serde_json::Value) -> String {
     base.to_string()
 }
 
+fn generate_terminal_api_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn hash_terminal_token(token: &str) -> Result<String, argon2::password_hash::Error> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(token.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+}
+
+async fn apply_correction_request(
+    repo: &SqliteRepository,
+    request: &AttendanceRequest,
+) -> Result<(PunchEvent, PunchEvent), StatusCode> {
+    let payload: CorrectionRequestPayload = serde_json::from_str(&request.requested_payload_json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let target_date = parse_date(&payload.date).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let correction_time =
+        parse_hhmm_time(&payload.time).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let target_event_type = match payload.target.as_str() {
+        "clock_in" => PunchEventType::ClockIn,
+        "clock_out" => PunchEventType::ClockOut,
+        _ => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+
+    let from = day_start_in_tokyo(target_date).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let to = day_end_in_tokyo(target_date).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let punches = repo
+        .list_in_range(request.employee_id, &from, &to)
+        .await
+        .map_err(repo_error_to_status)?;
+    let before_punch = punches
+        .into_iter()
+        .find(|punch| punch.event_type == target_event_type)
+        .ok_or(StatusCode::CONFLICT)?;
+    let corrected_at = before_punch
+        .occurred_at
+        .date()
+        .at(correction_time.0, correction_time.1, 0, 0)
+        .in_tz("Asia/Tokyo")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let updated_punch = PunchRepository::update(
+        repo,
+        before_punch.id,
+        PunchPatch {
+            event_type: Some(target_event_type),
+            occurred_at: Some(corrected_at),
+        },
+        "lineworks request approved".to_string(),
+    )
+    .await
+    .map_err(repo_error_to_status)?;
+
+    Ok((before_punch, updated_punch))
+}
+
+async fn append_attendance_request_audit(
+    state: &AdminAppState,
+    admin: &AuthenticatedAdmin,
+    action: &str,
+    before: &AttendanceRequest,
+    after: &AttendanceRequest,
+    metadata: serde_json::Value,
+) {
+    let _ = state
+        .repo
+        .append(NewAuditLog {
+            actor_type: "admin".to_string(),
+            actor_id: Some(admin.id.to_string()),
+            action: action.to_string(),
+            target_type: "attendance_request".to_string(),
+            target_id: Some(after.id.to_string()),
+            before_json: serde_json::to_string(before).ok(),
+            after_json: serde_json::to_string(after).ok(),
+            metadata_json: Some(metadata.to_string()),
+        })
+        .await;
+}
+
+async fn append_punch_update_audit(
+    state: &AdminAppState,
+    admin: &AuthenticatedAdmin,
+    before: &PunchEvent,
+    after: &PunchEvent,
+    request_id: Uuid,
+) {
+    let _ = state
+        .repo
+        .append(NewAuditLog {
+            actor_type: "admin".to_string(),
+            actor_id: Some(admin.id.to_string()),
+            action: "punch.update".to_string(),
+            target_type: "punch_event".to_string(),
+            target_id: Some(after.id.to_string()),
+            before_json: serde_json::to_string(before).ok(),
+            after_json: serde_json::to_string(after).ok(),
+            metadata_json: Some(
+                serde_json::json!({
+                    "reason": "lineworks request approved",
+                    "attendance_request_id": request_id,
+                })
+                .to_string(),
+            ),
+        })
+        .await;
+}
+
+#[derive(Deserialize)]
+struct CorrectionRequestPayload {
+    date: String,
+    target: String,
+    time: String,
+}
+
+fn parse_date(input: &str) -> Option<jiff::civil::Date> {
+    let (year, rest) = input.split_once('-')?;
+    let (month, day) = rest.split_once('-')?;
+    let year = year.parse::<i16>().ok()?;
+    let month = month.parse::<i8>().ok()?;
+    let day = day.parse::<i8>().ok()?;
+
+    jiff::civil::Date::new(year, month, day).ok()
+}
+
+fn parse_hhmm_time(input: &str) -> Option<(i8, i8)> {
+    let (hour, minute) = input.split_once(':')?;
+    let hour = hour.parse::<i8>().ok()?;
+    let minute = minute.parse::<i8>().ok()?;
+    if !(0..24).contains(&hour) || !(0..60).contains(&minute) {
+        return None;
+    }
+    Some((hour, minute))
+}
+
 fn build_monthly_attendance(
     employee_id: Uuid,
     year_month: YearMonth,
@@ -472,7 +926,10 @@ fn build_monthly_attendance(
         std::collections::BTreeMap::new();
 
     for punch in punches {
-        grouped.entry(punch.occurred_at.date()).or_default().push(punch);
+        grouped
+            .entry(punch.occurred_at.date())
+            .or_default()
+            .push(punch);
     }
 
     let days = grouped
@@ -502,7 +959,11 @@ fn to_monthly_attendance_response(timesheet: MonthlyTimesheet) -> MonthlyAttenda
             year: timesheet.year_month.year(),
             month: timesheet.year_month.month(),
         },
-        days: timesheet.days.into_iter().map(to_attendance_day_response).collect(),
+        days: timesheet
+            .days
+            .into_iter()
+            .map(to_attendance_day_response)
+            .collect(),
         total_work_minutes: timesheet.total_work_minutes,
         cutoff_rule: match timesheet.cutoff_rule {
             CutoffRule::DayOfMonth(day) => CutoffRuleResponse::DayOfMonth { day: day.value() },
@@ -822,6 +1283,416 @@ mod tests {
         assert_eq!(json["total_work_minutes"], 1050);
     }
 
+    #[tokio::test]
+    // 管理者は requested の修正申請を承認すると打刻を更新し、申請を applied に進める。
+    async fn approves_requested_correction_and_applies_punch_update() {
+        let (app, pool) = test_app_with_pool().await;
+        let employee_id = Uuid::now_v7();
+        let card_id = Uuid::now_v7();
+        let request_id = Uuid::now_v7();
+
+        insert_employee(&pool, employee_id).await;
+        insert_card(&pool, card_id, employee_id).await;
+        insert_punch(
+            &pool,
+            employee_id,
+            card_id,
+            "clock_in",
+            "2026-04-15T09:00:00+09:00[Asia/Tokyo]",
+        )
+        .await;
+        insert_attendance_request(
+            &pool,
+            request_id,
+            employee_id,
+            "correction",
+            r#"{"date":"2026-04-15","target":"clock_in","time":"08:32"}"#,
+            "requested",
+        )
+        .await;
+
+        let cookie = login_and_extract_cookie(app.clone()).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/attendance_requests/{request_id}/approve"))
+                    .header(axum::http::header::COOKIE, cookie)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "review_note": "承認して反映",
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request_row = sqlx::query(
+            "SELECT status, reviewed_by_admin_user_id, reviewed_at, review_note, applied_event_id FROM attendance_request WHERE id = ?",
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("attendance request row");
+        assert_eq!(request_row.get::<String, _>("status"), "applied");
+        assert!(
+            request_row
+                .get::<Option<String>, _>("reviewed_by_admin_user_id")
+                .is_some()
+        );
+        assert!(
+            request_row
+                .get::<Option<String>, _>("reviewed_at")
+                .is_some()
+        );
+        assert_eq!(
+            request_row.get::<Option<String>, _>("review_note"),
+            Some("承認して反映".to_string())
+        );
+        assert!(
+            request_row
+                .get::<Option<String>, _>("applied_event_id")
+                .is_some()
+        );
+
+        let punch_row = sqlx::query(
+            "SELECT occurred_at, correction_reason FROM punch_event WHERE employee_id = ? AND event_type = 'clock_in'",
+        )
+        .bind(employee_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("punch row");
+        assert_eq!(
+            punch_row.get::<String, _>("occurred_at"),
+            "2026-04-15T08:32:00+09:00[Asia/Tokyo]"
+        );
+        assert_eq!(
+            punch_row.get::<Option<String>, _>("correction_reason"),
+            Some("lineworks request approved".to_string())
+        );
+
+        let audit_rows =
+            sqlx::query("SELECT action FROM audit_log WHERE target_id = ? ORDER BY created_at ASC")
+                .bind(request_id.to_string())
+                .fetch_all(&pool)
+                .await
+                .expect("audit rows");
+        let actions: Vec<String> = audit_rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("action"))
+            .collect();
+        assert!(actions.contains(&"request.approved".to_string()));
+    }
+
+    #[tokio::test]
+    // 管理者は requested の修正申請を却下でき、audit_log に却下を残す。
+    async fn rejects_requested_correction_and_records_audit() {
+        let (app, pool) = test_app_with_pool().await;
+        let employee_id = Uuid::now_v7();
+        let request_id = Uuid::now_v7();
+
+        insert_employee(&pool, employee_id).await;
+        insert_attendance_request(
+            &pool,
+            request_id,
+            employee_id,
+            "correction",
+            r#"{"date":"2026-04-15","target":"clock_out","time":"18:05"}"#,
+            "requested",
+        )
+        .await;
+
+        let cookie = login_and_extract_cookie(app.clone()).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/attendance_requests/{request_id}/reject"))
+                    .header(axum::http::header::COOKIE, cookie)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "review_note": "証跡不足のため差し戻し",
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request_row = sqlx::query(
+            "SELECT status, review_note, applied_event_id FROM attendance_request WHERE id = ?",
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("attendance request row");
+        assert_eq!(request_row.get::<String, _>("status"), "rejected");
+        assert_eq!(
+            request_row.get::<Option<String>, _>("review_note"),
+            Some("証跡不足のため差し戻し".to_string())
+        );
+        assert!(
+            request_row
+                .get::<Option<String>, _>("applied_event_id")
+                .is_none()
+        );
+
+        let audit_row = sqlx::query(
+            "SELECT action, metadata_json FROM audit_log WHERE target_id = ? AND action = 'request.rejected'",
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("request.rejected audit row");
+        let metadata: Value = serde_json::from_str(&audit_row.get::<String, _>("metadata_json"))
+            .expect("metadata json");
+        assert_eq!(metadata["review_note"], "証跡不足のため差し戻し");
+    }
+
+    #[tokio::test]
+    // 管理者は status 指定で修正申請一覧を絞り込める。
+    async fn filters_attendance_requests_by_status() {
+        let (app, pool) = test_app_with_pool().await;
+        let employee_id = Uuid::now_v7();
+
+        insert_employee(&pool, employee_id).await;
+        insert_attendance_request(
+            &pool,
+            Uuid::now_v7(),
+            employee_id,
+            "correction",
+            r#"{"date":"2026-04-15","target":"clock_in","time":"08:32"}"#,
+            "requested",
+        )
+        .await;
+        insert_attendance_request(
+            &pool,
+            Uuid::now_v7(),
+            employee_id,
+            "correction",
+            r#"{"date":"2026-04-14","target":"clock_out","time":"18:05"}"#,
+            "rejected",
+        )
+        .await;
+
+        let cookie = login_and_extract_cookie(app.clone()).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/attendance_requests?status=requested")
+                    .header(axum::http::header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json.as_array().expect("array").len(), 1);
+        assert_eq!(json[0]["status"], "requested");
+    }
+
+    #[tokio::test]
+    // 管理者は登録済み terminal 一覧を取得できる。
+    async fn lists_registered_terminals() {
+        let (app, pool) = test_app_with_pool().await;
+        let terminal_id = Uuid::now_v7();
+
+        insert_terminal(&pool, terminal_id, "受付端末", "terminal-secret").await;
+
+        let cookie = login_and_extract_cookie(app.clone()).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/terminals")
+                    .header(axum::http::header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json.as_array().expect("terminals array").len(), 1);
+        assert_eq!(json[0]["id"], terminal_id.to_string());
+        assert_eq!(json[0]["name"], "受付端末");
+        assert_eq!(json[0]["is_active"], true);
+    }
+
+    #[tokio::test]
+    // 管理者は terminal を登録すると平文 token を一度だけ受け取り、監査ログが残る。
+    async fn registers_terminal_and_returns_plaintext_token() {
+        let (app, pool) = test_app_with_pool().await;
+        let cookie = login_and_extract_cookie(app.clone()).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/terminals")
+                    .header(axum::http::header::COOKIE, cookie)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "受付端末",
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["terminal"]["name"], "受付端末");
+        assert_eq!(json["terminal"]["is_active"], true);
+        assert!(
+            json["api_token"]
+                .as_str()
+                .is_some_and(|token| !token.is_empty())
+        );
+
+        let terminal_id = json["terminal"]["id"].as_str().expect("terminal id");
+        let terminal_row =
+            sqlx::query("SELECT name, api_token_hash, is_active FROM terminal WHERE id = ?")
+                .bind(terminal_id)
+                .fetch_one(&pool)
+                .await
+                .expect("terminal row");
+        assert_eq!(terminal_row.get::<String, _>("name"), "受付端末");
+        assert_ne!(
+            terminal_row.get::<String, _>("api_token_hash"),
+            json["api_token"].as_str().expect("api token")
+        );
+        assert_eq!(terminal_row.get::<i64, _>("is_active"), 1);
+
+        let audit_row = sqlx::query(
+            "SELECT action, target_type, target_id FROM audit_log WHERE action = 'terminal.registered'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("terminal.registered audit row");
+        assert_eq!(audit_row.get::<String, _>("target_type"), "terminal");
+        assert_eq!(audit_row.get::<String, _>("target_id"), terminal_id);
+    }
+
+    #[tokio::test]
+    // 管理者が terminal token を再発行すると旧 token は使えなくなり、新 token だけが有効になる。
+    async fn rotates_terminal_token_and_invalidates_previous_token() {
+        let (app, pool) = test_app_with_pool().await;
+        let terminal_id = Uuid::now_v7();
+        insert_terminal(&pool, terminal_id, "受付端末", "terminal-secret").await;
+        let cookie = login_and_extract_cookie(app.clone()).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/terminals/{terminal_id}/rotate_token"))
+                    .header(axum::http::header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+        let new_token = json["api_token"].as_str().expect("new api token");
+        assert!(!new_token.is_empty());
+
+        let repo = SqliteRepository::new(pool.clone());
+        let old_authenticated = repo
+            .authenticate_terminal_token("terminal-secret")
+            .await
+            .expect("authenticate old token");
+        assert!(old_authenticated.is_none());
+
+        let new_authenticated = repo
+            .authenticate_terminal_token(new_token)
+            .await
+            .expect("authenticate new token");
+        assert_eq!(
+            new_authenticated.expect("new token should authenticate").id,
+            terminal_id
+        );
+
+        let audit_row = sqlx::query(
+            "SELECT action, target_id FROM audit_log WHERE action = 'terminal.token_rotated'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("terminal.token_rotated audit row");
+        assert_eq!(
+            audit_row.get::<String, _>("target_id"),
+            terminal_id.to_string()
+        );
+    }
+
+    #[tokio::test]
+    // 管理者が terminal を無効化すると terminal token 認証に使えなくなる。
+    async fn deactivates_terminal_and_revokes_token_authentication() {
+        let (app, pool) = test_app_with_pool().await;
+        let terminal_id = Uuid::now_v7();
+        insert_terminal(&pool, terminal_id, "受付端末", "terminal-secret").await;
+        let cookie = login_and_extract_cookie(app.clone()).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/admin/terminals/{terminal_id}"))
+                    .header(axum::http::header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let row = sqlx::query("SELECT is_active FROM terminal WHERE id = ?")
+            .bind(terminal_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("terminal row");
+        assert_eq!(row.get::<i64, _>("is_active"), 0);
+
+        let repo = SqliteRepository::new(pool.clone());
+        let authenticated = repo
+            .authenticate_terminal_token("terminal-secret")
+            .await
+            .expect("authenticate token");
+        assert!(authenticated.is_none());
+    }
+
     async fn test_app() -> axum::Router {
         let (app, _pool) = test_app_with_pool().await;
         app
@@ -863,12 +1734,97 @@ mod tests {
         (app, pool)
     }
 
+    async fn login_and_extract_cookie(app: axum::Router) -> String {
+        let login_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/login")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "admin",
+                            "password": "correct horse battery staple",
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        login_response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .expect("set-cookie header")
+            .split(';')
+            .next()
+            .expect("cookie pair")
+            .to_string()
+    }
+
+    async fn insert_employee(pool: &sqlx::SqlitePool, employee_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO employee (id, display_name, employment_type, affiliation, is_active, note, created_at, updated_at)
+             VALUES (?, ?, ?, NULL, 1, NULL, ?, ?)",
+        )
+        .bind(employee_id.to_string())
+        .bind("山田太郎")
+        .bind("regular")
+        .bind("2026-04-20T00:00:00+09:00[Asia/Tokyo]")
+        .bind("2026-04-20T00:00:00+09:00[Asia/Tokyo]")
+        .execute(pool)
+        .await
+        .expect("insert employee");
+    }
+
+    async fn insert_card(pool: &sqlx::SqlitePool, card_id: Uuid, employee_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO card (id, employee_id, card_identifier, card_label, is_active, created_at, updated_at)
+             VALUES (?, ?, ?, NULL, 1, ?, ?)",
+        )
+        .bind(card_id.to_string())
+        .bind(employee_id.to_string())
+        .bind("02020212A91B9843")
+        .bind("2026-04-20T00:00:00+09:00[Asia/Tokyo]")
+        .bind("2026-04-20T00:00:00+09:00[Asia/Tokyo]")
+        .execute(pool)
+        .await
+        .expect("insert card");
+    }
+
+    async fn insert_terminal(pool: &sqlx::SqlitePool, terminal_id: Uuid, name: &str, token: &str) {
+        let now = "2026-04-20T00:00:00+09:00[Asia/Tokyo]";
+        sqlx::query(
+            "INSERT INTO terminal (id, name, api_token_hash, is_active, created_at, updated_at)
+             VALUES (?, ?, ?, 1, ?, ?)",
+        )
+        .bind(terminal_id.to_string())
+        .bind(name)
+        .bind(hash_token(token))
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert terminal");
+    }
+
     fn hash_password(password: &str) -> String {
         let salt =
             SaltString::from_b64("dGVzdF9hZG1pbl9zYWx0").expect("static salt should be valid");
         Argon2::default()
             .hash_password(password.as_bytes(), &salt)
             .expect("hash password")
+            .to_string()
+    }
+
+    fn hash_token(token: &str) -> String {
+        let salt =
+            SaltString::from_b64("dGVzdF90ZXJtaW5hbF9zYWx0").expect("static salt should be valid");
+        Argon2::default()
+            .hash_password(token.as_bytes(), &salt)
+            .expect("hash token")
             .to_string()
     }
 
@@ -902,5 +1858,27 @@ mod tests {
             .await
             .expect("count punch event");
         assert!(row.get::<i64, _>("count") >= 1);
+    }
+
+    async fn insert_attendance_request(
+        pool: &sqlx::SqlitePool,
+        request_id: Uuid,
+        employee_id: Uuid,
+        request_type: &str,
+        requested_payload_json: &str,
+        status: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO attendance_request (id, employee_id, request_type, requested_payload_json, status, requested_via, requested_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'lineworks', '2026-04-16T10:00:00+09:00[Asia/Tokyo]', '2026-04-16T10:00:00+09:00[Asia/Tokyo]', '2026-04-16T10:00:00+09:00[Asia/Tokyo]')",
+        )
+        .bind(request_id.to_string())
+        .bind(employee_id.to_string())
+        .bind(request_type)
+        .bind(requested_payload_json)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("insert attendance request");
     }
 }

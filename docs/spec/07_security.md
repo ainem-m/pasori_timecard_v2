@@ -39,6 +39,24 @@ Authorization: Bearer <token>
 Content-Type: application/json
 ```
 
+### Admin Web の Terminal 管理 API
+
+- `GET /api/admin/terminals`
+  - 登録済み terminal 一覧を返す
+- `POST /api/admin/terminals`
+  - `name` を受け取り terminal を登録する
+  - 平文 token はこのレスポンスで **一度だけ** 返す
+  - Server は `terminal.registered` を `audit_log` に記録する
+- `POST /api/admin/terminals/:id/rotate_token`
+  - terminal token を再発行する
+  - 旧 token は即時に無効化される
+  - 平文 token はこのレスポンスで **一度だけ** 返す
+  - Server は `terminal.token_rotated` を `audit_log` に記録する
+- `DELETE /api/admin/terminals/:id`
+  - terminal を無効化する
+  - 無効化後の token は認証に使えない
+  - Server は `terminal.deactivated` を `audit_log` に記録する
+
 ### LINE WORKS Bot → Server (callback)
 
 - **HMAC-SHA256 署名検証**
@@ -187,3 +205,9 @@ sudo systemctl start cloudflared
 - API token を URL クエリで送る (必ず Authorization header)
 - Session Cookie を非 HttpOnly で発行する
 - LINE WORKS callback の署名検証スキップ
+
+## 運用手順メモ
+
+- Bitwarden CLI と LINE WORKS Bot のセットアップ runbook は
+  [docs/archive/2026-04-21-bitwarden-lineworks-setup-runbook.md](../archive/2026-04-21-bitwarden-lineworks-setup-runbook.md)
+  を参照

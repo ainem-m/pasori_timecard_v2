@@ -22,7 +22,7 @@
 | 管理者 | `admin.login_success` / `admin.login_failure` / `admin.password_change` |
 | 設定 | `settings.update` (cutoff_date, ntp_tolerance, 他) |
 | LINE WORKS | `request.auto_approved` / `request.approved` / `request.rejected` |
-| その他 | `terminal.registered` / `terminal.token_rotated` |
+| その他 | `terminal.registered` / `terminal.token_rotated` / `terminal.deactivated` |
 
 ### データ構造
 

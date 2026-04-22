@@ -8,7 +8,9 @@ use pasori_core::domain::audit::{AuditLog, AuditLogFilter, NewAuditLog};
 use pasori_core::domain::card::Card;
 use pasori_core::domain::employee::{Employee, EmployeePatch, ExternalAccount, NewEmployee};
 use pasori_core::domain::punch::{NewPunchEvent, PunchEvent, PunchPatch};
-use pasori_core::domain::request::{AttendanceRequest, NewAttendanceRequest};
+use pasori_core::domain::request::{
+    AttendanceRequest, AttendanceRequestStatus, NewAttendanceRequest,
+};
 use pasori_core::domain::shift::{ShiftAssignment, ShiftType};
 use pasori_core::domain::time::YearMonth;
 use pasori_core::port::reader::CardId;
@@ -32,6 +34,16 @@ pub struct AuthenticatedTerminal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedAdmin {
     pub id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TerminalRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub is_active: bool,
+    pub last_seen_at: Option<Zoned>,
+    pub created_at: Zoned,
+    pub updated_at: Zoned,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +192,206 @@ impl SqliteRepository {
         .map_err(to_repo_error)?;
 
         rows.into_iter().map(map_punch_row).collect()
+    }
+
+    pub async fn list_terminals(&self) -> Result<Vec<TerminalRecord>, RepoError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, name, is_active, last_seen_at, created_at, updated_at
+            FROM terminal
+            ORDER BY created_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(to_repo_error)?;
+
+        rows.into_iter().map(map_terminal_row).collect()
+    }
+
+    pub async fn create_terminal(
+        &self,
+        name: &str,
+        api_token_hash: &str,
+    ) -> Result<TerminalRecord, RepoError> {
+        let now = Zoned::now();
+        let terminal = TerminalRecord {
+            id: Uuid::now_v7(),
+            name: name.to_string(),
+            is_active: true,
+            last_seen_at: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO terminal (id, name, api_token_hash, is_active, created_at, updated_at)
+            VALUES (?, ?, ?, 1, ?, ?)
+            "#,
+        )
+        .bind(terminal.id.to_string())
+        .bind(&terminal.name)
+        .bind(api_token_hash)
+        .bind(terminal.created_at.to_string())
+        .bind(terminal.updated_at.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(to_repo_error)?;
+
+        Ok(terminal)
+    }
+
+    pub async fn find_terminal(&self, id: Uuid) -> Result<Option<TerminalRecord>, RepoError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, name, is_active, last_seen_at, created_at, updated_at
+            FROM terminal
+            WHERE id = ?
+            "#,
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(to_repo_error)?;
+
+        row.map(map_terminal_row).transpose()
+    }
+
+    pub async fn rotate_terminal_token(
+        &self,
+        id: Uuid,
+        api_token_hash: &str,
+    ) -> Result<TerminalRecord, RepoError> {
+        let now = Zoned::now();
+        let result = sqlx::query(
+            r#"
+            UPDATE terminal
+            SET api_token_hash = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(api_token_hash)
+        .bind(now.to_string())
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(to_repo_error)?;
+
+        if result.rows_affected() == 0 {
+            return Err(RepoError::NotFound);
+        }
+
+        self.find_terminal(id).await?.ok_or(RepoError::NotFound)
+    }
+
+    pub async fn deactivate_terminal(&self, id: Uuid) -> Result<TerminalRecord, RepoError> {
+        let before = self.find_terminal(id).await?.ok_or(RepoError::NotFound)?;
+        let now = Zoned::now();
+        let result = sqlx::query(
+            r#"
+            UPDATE terminal
+            SET is_active = 0, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.to_string())
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(to_repo_error)?;
+
+        if result.rows_affected() == 0 {
+            return Err(RepoError::NotFound);
+        }
+
+        Ok(TerminalRecord {
+            is_active: false,
+            updated_at: now,
+            ..before
+        })
+    }
+
+    pub async fn list_attendance_requests(
+        &self,
+        status: Option<AttendanceRequestStatus>,
+    ) -> Result<Vec<AttendanceRequest>, RepoError> {
+        let rows = if let Some(status) = status {
+            let status_str = serde_json::to_string(&status)
+                .map_err(|e| RepoError::Db(e.to_string()))?
+                .replace('"', "");
+            sqlx::query(
+                r#"
+                SELECT *
+                FROM attendance_request
+                WHERE status = ?
+                ORDER BY requested_at DESC
+                "#,
+            )
+            .bind(status_str)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(to_repo_error)?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT *
+                FROM attendance_request
+                ORDER BY requested_at DESC
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(to_repo_error)?
+        };
+
+        rows.into_iter().map(map_attendance_request_row).collect()
+    }
+
+    pub async fn review_attendance_request(
+        &self,
+        id: Uuid,
+        reviewed_by_admin_user_id: Uuid,
+        next_status: AttendanceRequestStatus,
+        review_note: Option<String>,
+    ) -> Result<AttendanceRequest, RepoError> {
+        let existing = AttendanceRequestRepository::find(self, id)
+            .await?
+            .ok_or(RepoError::NotFound)?;
+        existing
+            .status
+            .transition_to(next_status)
+            .map_err(|e| RepoError::Conflict(e.to_string()))?;
+
+        let reviewed_at = Zoned::now();
+        let status_str = serde_json::to_string(&next_status)
+            .map_err(|e| RepoError::Db(e.to_string()))?
+            .replace('"', "");
+
+        sqlx::query(
+            r#"
+            UPDATE attendance_request
+            SET status = ?, reviewed_by_admin_user_id = ?, reviewed_at = ?, review_note = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(status_str)
+        .bind(reviewed_by_admin_user_id.to_string())
+        .bind(reviewed_at.to_string())
+        .bind(review_note.clone())
+        .bind(reviewed_at.to_string())
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(to_repo_error)?;
+
+        Ok(AttendanceRequest {
+            status: next_status,
+            reviewed_by_admin_user_id: Some(reviewed_by_admin_user_id),
+            reviewed_at: Some(reviewed_at),
+            review_note,
+            ..existing
+        })
     }
 
     pub async fn find_punch_by_id(&self, id: Uuid) -> Result<Option<PunchEvent>, RepoError> {
@@ -861,7 +1073,9 @@ impl AttendanceRequestRepository for SqliteRepository {
         let request_type_str = serde_json::to_string(&input.request_type)
             .unwrap()
             .replace("\"", "");
-        let status_str = "requested";
+        let status_str = serde_json::to_string(&input.status)
+            .unwrap()
+            .replace("\"", "");
         let source_str = serde_json::to_string(&input.requested_via)
             .unwrap()
             .replace("\"", "");
@@ -892,7 +1106,7 @@ impl AttendanceRequestRepository for SqliteRepository {
             employee_id: input.employee_id,
             request_type: input.request_type,
             requested_payload_json: input.requested_payload_json,
-            status: pasori_core::domain::request::AttendanceRequestStatus::Requested,
+            status: input.status,
             requested_via: input.requested_via,
             requested_at: input.requested_at,
             reviewed_by_admin_user_id: None,
@@ -911,6 +1125,40 @@ impl AttendanceRequestRepository for SqliteRepository {
             .map_err(to_repo_error)?;
 
         row.map(map_attendance_request_row).transpose()
+    }
+
+    async fn update_status(
+        &self,
+        id: Uuid,
+        status: pasori_core::domain::request::AttendanceRequestStatus,
+        applied_event_id: Option<Uuid>,
+    ) -> Result<AttendanceRequest, RepoError> {
+        let existing = AttendanceRequestRepository::find(self, id)
+            .await?
+            .ok_or(RepoError::NotFound)?;
+        let now = Zoned::now();
+        let status_str = serde_json::to_string(&status).unwrap().replace("\"", "");
+
+        sqlx::query(
+            r#"
+            UPDATE attendance_request
+            SET status = ?, applied_event_id = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(status_str)
+        .bind(applied_event_id.map(|value| value.to_string()))
+        .bind(now.to_string())
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(to_repo_error)?;
+
+        Ok(AttendanceRequest {
+            status,
+            applied_event_id,
+            ..existing
+        })
     }
 }
 
@@ -1049,6 +1297,21 @@ fn map_audit_log_row(row: sqlx::sqlite::SqliteRow) -> Result<AuditLog, RepoError
     })
 }
 
+fn map_terminal_row(row: sqlx::sqlite::SqliteRow) -> Result<TerminalRecord, RepoError> {
+    use sqlx::Row;
+    Ok(TerminalRecord {
+        id: Uuid::parse_str(row.get("id")).map_err(|e| RepoError::Db(e.to_string()))?,
+        name: row.get("name"),
+        is_active: row.get::<i32, _>("is_active") != 0,
+        last_seen_at: row
+            .get::<Option<String>, _>("last_seen_at")
+            .map(|s| parse_zoned(&s))
+            .transpose()?,
+        created_at: parse_zoned(row.get("created_at"))?,
+        updated_at: parse_zoned(row.get("updated_at"))?,
+    })
+}
+
 fn map_attendance_request_row(
     row: sqlx::sqlite::SqliteRow,
 ) -> Result<AttendanceRequest, RepoError> {
@@ -1121,7 +1384,9 @@ mod tests {
     use super::*;
     use argon2::password_hash::{PasswordHasher, SaltString};
     use pasori_core::port::policy::PunchEventType;
+    use sha2::{Digest, Sha384};
     use sqlx::sqlite::SqlitePoolOptions;
+    use std::str::FromStr;
 
     async fn setup_db() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -1135,6 +1400,136 @@ mod tests {
             .expect("failed to run migrations");
 
         pool
+    }
+
+    #[tokio::test]
+    // 旧 seed migration が適用済みの DB にも新しい migration を継続適用できる。
+    async fn keeps_migrating_when_seed_migration_was_already_applied_with_legacy_checksum() {
+        let database_url = format!("sqlite:file:{}?mode=memory&cache=shared", Uuid::now_v7());
+        let pool = SqlitePoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("failed to connect to memory db");
+
+        sqlx::query(
+            r#"
+            CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("failed to create migration table");
+
+        sqlx::query(include_str!(
+            "../../../../migrations/20260416000000_initial_schema.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("failed to apply initial schema");
+        sqlx::query(include_str!(
+            "../../../../migrations/20260417000001_seed_test_data.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("failed to apply seed data");
+        sqlx::query(include_str!(
+            "../../../../migrations/20260420000100_admin_lockout_and_session_activity.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("failed to apply admin migration");
+
+        let legacy_seed_sql = r#"-- Seed test data for development
+-- カード ID '01010112A91B9843' を持つ従業員を登録
+
+INSERT INTO employee (
+    id, display_name, employment_type, affiliation, is_active, created_at, updated_at
+) VALUES (
+    '0195085e-9900-7f21-88f5-66778899aabb', -- UUID v7
+    'テスト 太郎',
+    'regular',
+    '開発部',
+    1,
+    '2026-04-17T00:00:00+09:00',
+    '2026-04-17T00:00:00+09:00'
+);
+
+INSERT INTO card (
+    id, employee_id, card_identifier, card_label, is_active, created_at, updated_at
+) VALUES (
+    '0195085e-9901-7acc-99aa-bbccddeeff00',
+    '0195085e-9900-7f21-88f5-66778899aabb',
+    '01010112A91B9843', -- スキャンされた IDm
+    'テスト用カード',
+    1,
+    '2026-04-17T00:00:00+09:00',
+    '2026-04-17T00:00:00+09:00'
+);
+"#;
+
+        let initial_checksum = Sha384::digest(
+            include_str!("../../../../migrations/20260416000000_initial_schema.sql").as_bytes(),
+        );
+        let legacy_seed_checksum = Sha384::digest(legacy_seed_sql.as_bytes());
+        let admin_checksum = Sha384::digest(
+            include_str!(
+                "../../../../migrations/20260420000100_admin_lockout_and_session_activity.sql"
+            )
+            .as_bytes(),
+        );
+
+        for (version, description, checksum) in [
+            (
+                20260416000000_i64,
+                "initial schema",
+                initial_checksum.as_slice(),
+            ),
+            (
+                20260417000001_i64,
+                "seed test data",
+                legacy_seed_checksum.as_slice(),
+            ),
+            (
+                20260420000100_i64,
+                "admin lockout and session activity",
+                admin_checksum.as_slice(),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (?, ?, 1, ?, 0)",
+            )
+            .bind(version)
+            .bind(description)
+            .bind(checksum)
+            .execute(&pool)
+            .await
+            .expect("failed to insert applied migration");
+        }
+
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("failed to continue migrations");
+
+        let (created_at, updated_at): (String, String) =
+            sqlx::query_as("SELECT created_at, updated_at FROM employee WHERE id = ?")
+                .bind("0195085e-9900-7f21-88f5-66778899aabb")
+                .fetch_one(&pool)
+                .await
+                .expect("failed to fetch seeded employee");
+
+        let created_at = Zoned::from_str(&created_at).expect("created_at should parse as Zoned");
+        let updated_at = Zoned::from_str(&updated_at).expect("updated_at should parse as Zoned");
+
+        assert_eq!(created_at.time_zone().iana_name(), Some("Asia/Tokyo"));
+        assert_eq!(updated_at.time_zone().iana_name(), Some("Asia/Tokyo"));
     }
 
     #[tokio::test]

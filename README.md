@@ -49,3 +49,21 @@ docs/
 - 該当 `docs/spec/*.md` を同一 PR で更新
 - 用語を増やしたら `docs/glossary.md` も更新
 - 変更理由が大きいなら ADR を追加
+
+## Local Helpers
+
+LINE WORKS 用の secret を Bitwarden から注入して server を起動する補助スクリプト:
+
+```bash
+scripts/bw-run-server.sh
+```
+
+前提:
+
+- `bw` CLI が利用可能
+- 既に `BW_SESSION` を export 済み、または `BW_MASTER_PASSWORD` を設定済み
+- Bitwarden に以下の item 名が存在する
+  - `lineworks-bot-id`
+  - `lineworks-bot-secret`
+  - `lineworks-api-token`
+  - 必要なら `lineworks-admin-channel-id`

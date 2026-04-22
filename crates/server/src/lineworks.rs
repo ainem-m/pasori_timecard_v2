@@ -234,6 +234,17 @@ mod tests {
             > {
                 unimplemented!()
             }
+            async fn update_status(
+                &self,
+                _: uuid::Uuid,
+                _: pasori_core::domain::request::AttendanceRequestStatus,
+                _: Option<uuid::Uuid>,
+            ) -> Result<
+                pasori_core::domain::request::AttendanceRequest,
+                pasori_core::port::repo::RepoError,
+            > {
+                unimplemented!()
+            }
         }
         #[async_trait::async_trait]
         impl pasori_core::port::repo::PunchRepository for Mock {

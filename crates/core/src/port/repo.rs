@@ -6,7 +6,7 @@ use crate::domain::audit::{AuditLog, AuditLogFilter, NewAuditLog};
 use crate::domain::card::Card;
 use crate::domain::employee::{Employee, EmployeePatch, ExternalAccount, NewEmployee};
 use crate::domain::punch::{NewPunchEvent, PunchEvent, PunchPatch};
-use crate::domain::request::{AttendanceRequest, NewAttendanceRequest};
+use crate::domain::request::{AttendanceRequest, AttendanceRequestStatus, NewAttendanceRequest};
 use crate::domain::shift::{ShiftAssignment, ShiftType};
 use crate::domain::time::YearMonth;
 use crate::port::reader::CardId;
@@ -86,6 +86,12 @@ pub trait ExternalAccountRepository: Send + Sync {
 pub trait AttendanceRequestRepository: Send + Sync {
     async fn create(&self, input: NewAttendanceRequest) -> Result<AttendanceRequest, RepoError>;
     async fn find(&self, id: Uuid) -> Result<Option<AttendanceRequest>, RepoError>;
+    async fn update_status(
+        &self,
+        id: Uuid,
+        status: AttendanceRequestStatus,
+        applied_event_id: Option<Uuid>,
+    ) -> Result<AttendanceRequest, RepoError>;
 }
 
 #[derive(Debug, thiserror::Error)]

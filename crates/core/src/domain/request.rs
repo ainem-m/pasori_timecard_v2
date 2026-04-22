@@ -16,6 +16,7 @@ pub enum AttendanceRequestType {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AttendanceRequestSource {
+    #[serde(rename = "lineworks")]
     LineWorks,
     Ui,
 }
@@ -51,6 +52,7 @@ pub struct NewAttendanceRequest {
     pub employee_id: Uuid,
     pub request_type: AttendanceRequestType,
     pub requested_payload_json: String,
+    pub status: AttendanceRequestStatus,
     pub requested_via: AttendanceRequestSource,
     pub requested_at: Zoned,
 }
@@ -104,7 +106,9 @@ pub enum AttendanceRequestTransitionError {
 
 #[cfg(test)]
 mod tests {
-    use super::{AttendanceRequestStatus, AttendanceRequestTransitionError};
+    use super::{
+        AttendanceRequestSource, AttendanceRequestStatus, AttendanceRequestTransitionError,
+    };
     use proptest::prelude::*;
 
     #[test]
@@ -190,6 +194,15 @@ mod tests {
             AttendanceRequestStatus::Applied.transition_to(AttendanceRequestStatus::Approved),
             Err(AttendanceRequestTransitionError::InvalidTransition { .. })
         ));
+    }
+
+    #[test]
+    // LINE WORKS 経由の申請元は spec 通り lineworks で直列化する。
+    fn serializes_lineworks_source_without_extra_underscore() {
+        let serialized =
+            serde_json::to_string(&AttendanceRequestSource::LineWorks).expect("serialize source");
+
+        assert_eq!(serialized, "\"lineworks\"");
     }
 
     proptest! {

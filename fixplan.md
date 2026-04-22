@@ -50,16 +50,16 @@
 
 ### 未着手または未完了の項目
 
-- LINE WORKS の修正申請承認フロー、追加通知分岐
+- LINE WORKS の管理者承認経由の修正反映処理、追加通知分岐
 - `import_v1` の実データ移行処理
 - DoD にある lint / typecheck / fmt / clippy / 起動確認の完走
 - E2E (`pnpm -C web/terminal test:e2e`) の整備と実行
 
 ### 実装上の残課題
 
-- `crates/server/src/lineworks.rs` に `unimplemented!()` が残っている
-- `crates/core/src/application/lineworks.rs` に修正申請フロー向けの暫定 TODO が残っている
-- `crates/server/src/infra/lineworks_notify.rs` は一部通知イベントのみ実装
+- `crates/server/src/lineworks.rs` に test double の `unimplemented!()` が残っている
+- `crates/server/src/infra/lineworks_notify.rs` は本人向け通知の recipient 解決が未実装
+- Admin Web 側の修正申請 UI は未着手
 - `crates/import_v1/src/main.rs` は stub のまま
 
 ### 検証状況
@@ -72,7 +72,7 @@
 ### 次に着手すべき順序
 
 1. Admin 勤怠 API の仕様固定と employee / 期間ベース化
-2. LINE WORKS use case の未実装分岐を完了
+2. LINE WORKS 通知分岐と Admin Web 側 UI を仕上げる
 3. `import_v1` の移行 CLI を実装
 4. DoD の検証コマンドを一式 green にする
 
@@ -85,6 +85,7 @@
 - [x] 未登録カード検出時の audit 記録を追加する
 - [x] オフライン再送で `source=local_cached` を保持する
 - [ ] Admin 勤怠一覧 API を仕様に沿う形へ修正する
+- [ ] LINE WORKS の本人向け通知 recipient 解決を実装する
 - [ ] Frontend / Rust の検証を green にする
 
 ## 詳細タスク
