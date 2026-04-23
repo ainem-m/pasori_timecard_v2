@@ -1,31 +1,40 @@
 use async_trait::async_trait;
 use jiff::Zoned;
 use pasori_core::port::notify::{Notifier, NotifyError, NotifyEvent};
+use pasori_core::port::repo::ExternalAccountRepository;
 use serde_json::json;
+use std::sync::Arc;
 
 pub struct LineworksNotifier {
     client: reqwest::Client,
     bot_id: String,
     api_token: String,
     admin_channel_id: Option<String>,
+    external_repo: Arc<dyn ExternalAccountRepository>,
 }
 
 impl LineworksNotifier {
-    pub fn new(bot_id: String, api_token: String) -> Self {
+    pub fn new(
+        bot_id: String,
+        api_token: String,
+        external_repo: Arc<dyn ExternalAccountRepository>,
+    ) -> Self {
         let admin_channel_id = std::env::var("LINEWORKS_ADMIN_CHANNEL_ID").ok();
-        Self::new_with_admin_channel(bot_id, api_token, admin_channel_id)
+        Self::new_with_admin_channel(bot_id, api_token, admin_channel_id, external_repo)
     }
 
     pub fn new_with_admin_channel(
         bot_id: String,
         api_token: String,
         admin_channel_id: Option<String>,
+        external_repo: Arc<dyn ExternalAccountRepository>,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
             bot_id,
             api_token,
             admin_channel_id,
+            external_repo,
         }
     }
 }
@@ -33,13 +42,22 @@ impl LineworksNotifier {
 #[async_trait]
 impl Notifier for LineworksNotifier {
     async fn notify(&self, event: NotifyEvent) -> Result<(), NotifyError> {
-        let Some((target, text)) = build_delivery_request(&event, self.admin_channel_id.as_deref())
-        else {
-            tracing::warn!(
-                ?event,
-                "LINE WORKS notification skipped due to unresolved recipient"
-            );
-            return Ok(());
+        let result = build_delivery_request(&event, self.admin_channel_id.as_deref());
+        let (target, text) = match result {
+            Some((target, text)) => (target, text),
+            None => {
+                let resolved = self.resolve_recipient(&event).await;
+                match resolved {
+                    Some((target, text)) => (target, text),
+                    None => {
+                        tracing::warn!(
+                            ?event,
+                            "LINE WORKS notification skipped due to unresolved recipient"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
         };
 
         let url = match target {
@@ -82,33 +100,79 @@ impl Notifier for LineworksNotifier {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeliveryTarget<'a> {
-    User(&'a str),
-    Channel(&'a str),
+impl LineworksNotifier {
+    async fn resolve_recipient(&self, event: &NotifyEvent) -> Option<(DeliveryTarget, String)> {
+        match event {
+            NotifyEvent::MissingPunchSuspected { employee_id, at } => {
+                let account = self
+                    .external_repo
+                    .find_by_employee_id("lineworks", *employee_id)
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(acc) = account {
+                    Some((
+                        DeliveryTarget::User(acc.external_user_id.clone()),
+                        format!(
+                            "【打刻漏れの疑い】\n{} 時点で打刻が確認されていません。管理者に確認してください。",
+                            at.strftime("%Y-%m-%d %H:%M")
+                        ),
+                    ))
+                } else {
+                    self.admin_channel_id.as_deref().map(|channel_id| {
+                        (
+                            DeliveryTarget::Channel(channel_id.to_string()),
+                            format!(
+                                "【打刻漏れの疑れ】\n従業員 {} の {} 時点での打刻が確認されていません。",
+                                employee_id,
+                                at.strftime("%Y-%m-%d %H:%M")
+                            ),
+                        )
+                    })
+                }
+            }
+            NotifyEvent::ShiftPublished { target_month } => {
+                let admin_channel_id = self.admin_channel_id.as_deref()?;
+                Some((
+                    DeliveryTarget::Channel(admin_channel_id.to_string()),
+                    format!(
+                        "【シフト公開】\n{}月のシフトが公開されました。",
+                        target_month.month()
+                    ),
+                ))
+            }
+            _ => None,
+        }
+    }
 }
 
-fn build_delivery_request<'a>(
-    event: &'a NotifyEvent,
-    admin_channel_id: Option<&'a str>,
-) -> Option<(DeliveryTarget<'a>, String)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeliveryTarget {
+    User(String),
+    Channel(String),
+}
+
+fn build_delivery_request(
+    event: &NotifyEvent,
+    admin_channel_id: Option<&str>,
+) -> Option<(DeliveryTarget, String)> {
     match event {
         NotifyEvent::LineworksResponse { user_id, text } => {
-            Some((DeliveryTarget::User(user_id.as_str()), text.clone()))
+            Some((DeliveryTarget::User(user_id.clone()), text.clone()))
         }
         NotifyEvent::UnregisteredCardDetected { card_id, at } => Some((
-            DeliveryTarget::Channel(admin_channel_id?),
+            DeliveryTarget::Channel(admin_channel_id?.to_string()),
             format_unregistered_card_message(card_id.0.as_str(), at),
         )),
         NotifyEvent::DailyClosingResult { date, summary } => Some((
-            DeliveryTarget::Channel(admin_channel_id?),
+            DeliveryTarget::Channel(admin_channel_id?.to_string()),
             format!("【日次締め結果】\n対象日: {date}\n{summary}"),
         )),
         NotifyEvent::AdminCorrectionApplied {
             actor,
             target_punch,
         } => Some((
-            DeliveryTarget::Channel(admin_channel_id?),
+            DeliveryTarget::Channel(admin_channel_id?.to_string()),
             format!(
                 "【勤怠修正反映】\n管理者 {actor} が打刻 {target_punch} に修正を反映しました。"
             ),
@@ -159,7 +223,7 @@ mod tests {
         let (target, text) =
             build_delivery_request(&event, Some("admin-channel")).expect("delivery request");
 
-        assert_eq!(target, DeliveryTarget::Channel("admin-channel"));
+        assert_eq!(target, DeliveryTarget::Channel("admin-channel".to_string()));
         assert!(text.contains("未登録カード"));
         assert!(text.contains("0202..."));
     }
@@ -175,7 +239,7 @@ mod tests {
         let (target, text) =
             build_delivery_request(&event, Some("admin-channel")).expect("delivery request");
 
-        assert_eq!(target, DeliveryTarget::User("user-1"));
+        assert_eq!(target, DeliveryTarget::User("user-1".to_string()));
         assert_eq!(text, "返信");
     }
 
@@ -236,7 +300,7 @@ mod tests {
         let (target, text) =
             build_delivery_request(&event, Some("admin-channel")).expect("delivery request");
 
-        assert_eq!(target, DeliveryTarget::Channel("admin-channel"));
+        assert_eq!(target, DeliveryTarget::Channel("admin-channel".to_string()));
         assert!(text.contains(&actor.to_string()));
         assert!(text.contains(&target_punch.to_string()));
     }

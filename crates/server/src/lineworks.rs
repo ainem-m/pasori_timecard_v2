@@ -202,6 +202,16 @@ mod tests {
             > {
                 Ok(None)
             }
+            async fn find_by_employee_id(
+                &self,
+                _: &str,
+                _: uuid::Uuid,
+            ) -> Result<
+                Option<pasori_core::domain::employee::ExternalAccount>,
+                pasori_core::port::repo::RepoError,
+            > {
+                Ok(None)
+            }
             async fn bind(
                 &self,
                 _: uuid::Uuid,

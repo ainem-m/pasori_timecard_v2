@@ -1115,6 +1115,14 @@ mod tests {
         {
             Ok(self.account.clone())
         }
+        async fn find_by_employee_id(
+            &self,
+            _: &str,
+            _: uuid::Uuid,
+        ) -> Result<Option<crate::domain::employee::ExternalAccount>, crate::port::repo::RepoError>
+        {
+            Ok(self.account.clone())
+        }
         async fn bind(
             &self,
             _: uuid::Uuid,

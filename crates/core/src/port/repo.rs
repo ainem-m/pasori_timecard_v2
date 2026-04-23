@@ -74,6 +74,11 @@ pub trait ExternalAccountRepository: Send + Sync {
         provider: &str,
         external_user_id: &str,
     ) -> Result<Option<ExternalAccount>, RepoError>;
+    async fn find_by_employee_id(
+        &self,
+        provider: &str,
+        employee_id: Uuid,
+    ) -> Result<Option<ExternalAccount>, RepoError>;
     async fn bind(
         &self,
         employee_id: Uuid,

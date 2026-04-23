@@ -4,6 +4,7 @@ use argon2::{
 };
 use async_trait::async_trait;
 use jiff::Zoned;
+use pasori_core::domain::admin::AdminUser;
 use pasori_core::domain::audit::{AuditLog, AuditLogFilter, NewAuditLog};
 use pasori_core::domain::card::Card;
 use pasori_core::domain::employee::{Employee, EmployeePatch, ExternalAccount, NewEmployee};
@@ -47,14 +48,8 @@ pub struct TerminalRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdminUserRecord {
-    pub id: Uuid,
-    pub display_name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdminAuthenticationResult {
-    Authenticated(AdminUserRecord),
+    Authenticated(AdminUser),
     InvalidCredentials,
     Locked { locked_until: Zoned },
 }
@@ -412,7 +407,7 @@ impl SqliteRepository {
         let now = Zoned::now();
         let row = sqlx::query(
             r#"
-            SELECT id, display_name, password_hash, failed_login_attempts, locked_until
+            SELECT id, username, display_name, password_hash, is_active, failed_login_attempts, locked_until, created_at, updated_at
             FROM admin_user
             WHERE username = ? AND is_active = 1
             "#,
@@ -428,9 +423,21 @@ impl SqliteRepository {
 
         let admin_id = Uuid::parse_str(&row.try_get::<String, _>("id").map_err(to_repo_error)?)
             .map_err(|e| RepoError::Db(e.to_string()))?;
+        let admin_username = row
+            .try_get::<String, _>("username")
+            .map_err(to_repo_error)?;
         let display_name = row
             .try_get::<String, _>("display_name")
             .map_err(to_repo_error)?;
+        let is_active = row.try_get::<i32, _>("is_active").map_err(to_repo_error)? != 0;
+        let created_at = parse_zoned(
+            &row.try_get::<String, _>("created_at")
+                .map_err(to_repo_error)?,
+        )?;
+        let updated_at = parse_zoned(
+            &row.try_get::<String, _>("updated_at")
+                .map_err(to_repo_error)?,
+        )?;
         let failed_login_attempts = row
             .try_get::<i64, _>("failed_login_attempts")
             .map_err(to_repo_error)?;
@@ -510,9 +517,13 @@ impl SqliteRepository {
         .await
         .map_err(to_repo_error)?;
 
-        Ok(AdminAuthenticationResult::Authenticated(AdminUserRecord {
+        Ok(AdminAuthenticationResult::Authenticated(AdminUser {
             id: admin_id,
+            username: admin_username,
             display_name,
+            is_active,
+            created_at,
+            updated_at,
         }))
     }
 
@@ -940,6 +951,24 @@ impl ExternalAccountRepository for SqliteRepository {
         )
         .bind(provider)
         .bind(external_user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(to_repo_error)?;
+
+        row.map(map_external_account_row).transpose()
+    }
+
+    async fn find_by_employee_id(
+        &self,
+        provider: &str,
+        employee_id: Uuid,
+    ) -> Result<Option<ExternalAccount>, RepoError> {
+        let emp_id_str = employee_id.to_string();
+        let row = sqlx::query(
+            "SELECT * FROM external_account WHERE provider = ? AND employee_id = ? AND is_verified = 1",
+        )
+        .bind(provider)
+        .bind(emp_id_str)
         .fetch_optional(&self.pool)
         .await
         .map_err(to_repo_error)?;
@@ -1721,13 +1750,11 @@ INSERT INTO card (
             .verify_admin_credentials("admin", "correct-password")
             .await
             .expect("verify");
-        assert_eq!(
-            admin,
-            AdminAuthenticationResult::Authenticated(AdminUserRecord {
-                id: admin_id,
-                display_name: "管理者".to_string(),
-            })
-        );
+        let AdminAuthenticationResult::Authenticated(admin_user) = admin else {
+            panic!("expected authenticated result");
+        };
+        assert_eq!(admin_user.id, admin_id);
+        assert_eq!(admin_user.display_name, "管理者");
     }
 
     #[tokio::test]

@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
     ) {
         (Ok(bot_id), Ok(bot_token)) => {
             tracing::info!("LINE WORKS notifier initialized");
-            Arc::new(LineworksNotifier::new(bot_id, bot_token))
+            Arc::new(LineworksNotifier::new(bot_id, bot_token, repo.clone()))
         }
         _ => {
             tracing::warn!("LINE WORKS credentials missing, falling back to ConsoleNotifier");
