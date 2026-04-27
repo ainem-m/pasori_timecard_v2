@@ -127,17 +127,12 @@ function App() {
     setIsSubmitting(true);
     
     try {
-      const punchId = crypto.randomUUID(); 
-      const now = new Date().toISOString();
       const type = overrideType || suggestedType;
       
       await invoke('submit_punch', {
-        req: {
-          punch_id: punchId,
+        params: {
           card_id: scannedCardIdRef.current,
           event_type: type,
-          occurred_at: now,
-          source: 'terminal',
         }
       });
       

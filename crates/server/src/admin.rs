@@ -13,7 +13,9 @@ use axum::{
 use base64::Engine;
 use pasori_core::domain::audit::NewAuditLog;
 use pasori_core::domain::employee::{EmployeePatch, NewEmployee};
-use pasori_core::domain::punch::{AttendanceDay, AttendanceDayStatus, PunchEvent, PunchPatch};
+use pasori_core::domain::punch::{
+    AttendanceDay, AttendanceDayStatus, NewPunchEvent, PunchEvent, PunchPatch,
+};
 use pasori_core::domain::request::{
     AttendanceRequest, AttendanceRequestStatus, AttendanceRequestType,
 };
@@ -21,7 +23,8 @@ use pasori_core::domain::time::{CutoffDay, CutoffRule, MonthlyTimesheet, YearMon
 use pasori_core::port::policy::NoRounding;
 use pasori_core::port::policy::PunchEventType;
 use pasori_core::port::repo::{
-    AttendanceRequestRepository, AuditLogRepository, EmployeeRepository, PunchRepository, RepoError,
+    AttendanceRequestRepository, AuditLogRepository, CardRepository, EmployeeRepository,
+    PunchRepository, RepoError,
 };
 use rand::{RngCore, rngs::OsRng};
 use serde::Deserialize;
@@ -166,7 +169,7 @@ async fn login(
                 Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
             };
 
-            let _ = state
+            if let Err(e) = state
                 .repo
                 .append(NewAuditLog {
                     actor_type: "admin".to_string(),
@@ -184,7 +187,10 @@ async fn login(
                         }),
                     )),
                 })
-                .await;
+                .await
+            {
+                tracing::error!(error = %e, action = "admin.login_success", "audit log append failed");
+            }
 
             let cookie = match build_admin_session_cookie(&session_id) {
                 Ok(cookie) => cookie,
@@ -199,7 +205,7 @@ async fn login(
             ))
         }
         Ok(AdminAuthenticationResult::InvalidCredentials) => {
-            let _ = state
+            if let Err(e) = state
                 .repo
                 .append(NewAuditLog {
                     actor_type: "system".to_string(),
@@ -211,12 +217,15 @@ async fn login(
                     after_json: None,
                     metadata_json: Some(metadata_json),
                 })
-                .await;
+                .await
+            {
+                tracing::error!(error = %e, action = "admin.login_failure", "audit log append failed");
+            }
 
             Err(StatusCode::UNAUTHORIZED)
         }
         Ok(AdminAuthenticationResult::Locked { locked_until }) => {
-            let _ = state
+            if let Err(e) = state
                 .repo
                 .append(NewAuditLog {
                     actor_type: "system".to_string(),
@@ -233,7 +242,10 @@ async fn login(
                         }),
                     )),
                 })
-                .await;
+                .await
+            {
+                tracing::error!(error = %e, action = "admin.login_locked", "audit log append failed");
+            }
 
             Err(StatusCode::LOCKED)
         }
@@ -253,7 +265,7 @@ async fn logout(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if let Some(admin_user_id) = admin_user_id {
-        let _ = state
+        if let Err(e) = state
             .repo
             .append(NewAuditLog {
                 actor_type: "admin".to_string(),
@@ -265,7 +277,10 @@ async fn logout(
                 after_json: None,
                 metadata_json: Some(login_metadata_json(&headers, "")),
             })
-            .await;
+            .await
+        {
+            tracing::error!(error = %e, action = "admin.logout", "audit log append failed");
+        }
     }
 
     Ok((
@@ -297,13 +312,31 @@ async fn create_employee(
     State(state): State<AdminAppState>,
     Json(input): Json<NewEmployee>,
 ) -> impl IntoResponse {
-    let _admin = match authenticate_admin_request(&state, &headers).await {
+    let admin = match authenticate_admin_request(&state, &headers).await {
         Ok(admin) => admin,
         Err(status) => return Err(status),
     };
 
     match EmployeeRepository::create(&*state.repo, input).await {
-        Ok(employee) => Ok((StatusCode::CREATED, Json(employee))),
+        Ok(employee) => {
+            if let Err(e) = state
+                .repo
+                .append(NewAuditLog {
+                    actor_type: "admin".to_string(),
+                    actor_id: Some(admin.id.to_string()),
+                    action: "employee.create".to_string(),
+                    target_type: "employee".to_string(),
+                    target_id: Some(employee.id.to_string()),
+                    before_json: None,
+                    after_json: serde_json::to_string(&employee).ok(),
+                    metadata_json: None,
+                })
+                .await
+            {
+                tracing::error!(error = %e, action = "employee.create", "audit log append failed");
+            }
+            Ok((StatusCode::CREATED, Json(employee)))
+        }
         Err(e) => {
             tracing::error!(error = ?e, "create_employee error");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -337,13 +370,37 @@ async fn update_employee(
     Path(id): Path<Uuid>,
     Json(patch): Json<EmployeePatch>,
 ) -> impl IntoResponse {
-    let _admin = match authenticate_admin_request(&state, &headers).await {
+    let admin = match authenticate_admin_request(&state, &headers).await {
         Ok(admin) => admin,
         Err(status) => return Err(status),
     };
 
+    let before = match EmployeeRepository::find(&*state.repo, id).await {
+        Ok(Some(employee)) => employee,
+        Ok(None) => return Err(StatusCode::NOT_FOUND),
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+
     match EmployeeRepository::update(&*state.repo, id, patch).await {
-        Ok(employee) => Ok(Json(employee)),
+        Ok(employee) => {
+            if let Err(e) = state
+                .repo
+                .append(NewAuditLog {
+                    actor_type: "admin".to_string(),
+                    actor_id: Some(admin.id.to_string()),
+                    action: "employee.update".to_string(),
+                    target_type: "employee".to_string(),
+                    target_id: Some(id.to_string()),
+                    before_json: serde_json::to_string(&before).ok(),
+                    after_json: serde_json::to_string(&employee).ok(),
+                    metadata_json: None,
+                })
+                .await
+            {
+                tracing::error!(error = %e, action = "employee.update", "audit log append failed");
+            }
+            Ok(Json(employee))
+        }
         Err(e) => {
             tracing::error!(error = ?e, id = ?id, "update_employee error");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -356,13 +413,31 @@ async fn deactivate_employee(
     State(state): State<AdminAppState>,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let _admin = match authenticate_admin_request(&state, &headers).await {
+    let admin = match authenticate_admin_request(&state, &headers).await {
         Ok(admin) => admin,
         Err(status) => return Err(status),
     };
 
     match state.repo.deactivate(id).await {
-        Ok(_) => Ok(StatusCode::NO_CONTENT),
+        Ok(_) => {
+            if let Err(e) = state
+                .repo
+                .append(NewAuditLog {
+                    actor_type: "admin".to_string(),
+                    actor_id: Some(admin.id.to_string()),
+                    action: "employee.deactivate".to_string(),
+                    target_type: "employee".to_string(),
+                    target_id: Some(id.to_string()),
+                    before_json: None,
+                    after_json: None,
+                    metadata_json: None,
+                })
+                .await
+            {
+                tracing::error!(error = %e, action = "employee.deactivate", "audit log append failed");
+            }
+            Ok(StatusCode::NO_CONTENT)
+        }
         Err(e) => {
             tracing::error!(error = ?e, id = ?id, "deactivate_employee error");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -415,7 +490,7 @@ async fn create_terminal(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let _ = state
+    if let Err(e) = state
         .repo
         .append(NewAuditLog {
             actor_type: "admin".to_string(),
@@ -432,7 +507,10 @@ async fn create_terminal(
                 .to_string(),
             ),
         })
-        .await;
+        .await
+    {
+        tracing::error!(error = %e, action = "terminal.registered", "audit log append failed");
+    }
 
     Ok((
         StatusCode::CREATED,
@@ -464,7 +542,7 @@ async fn rotate_terminal_token(
         .await
         .map_err(repo_error_to_status)?;
 
-    let _ = state
+    if let Err(e) = state
         .repo
         .append(NewAuditLog {
             actor_type: "admin".to_string(),
@@ -481,7 +559,10 @@ async fn rotate_terminal_token(
                 .to_string(),
             ),
         })
-        .await;
+        .await
+    {
+        tracing::error!(error = %e, action = "terminal.token_rotated", "audit log append failed");
+    }
 
     Ok(Json(RotateTerminalTokenResponse {
         terminal,
@@ -507,7 +588,7 @@ async fn deactivate_terminal(
         .await
         .map_err(repo_error_to_status)?;
 
-    let _ = state
+    if let Err(e) = state
         .repo
         .append(NewAuditLog {
             actor_type: "admin".to_string(),
@@ -524,7 +605,10 @@ async fn deactivate_terminal(
                 .to_string(),
             ),
         })
-        .await;
+        .await
+    {
+        tracing::error!(error = %e, action = "terminal.deactivated", "audit log append failed");
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -585,10 +669,6 @@ async fn approve_attendance_request(
         .map_err(repo_error_to_status)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    if request.request_type != AttendanceRequestType::Correction {
-        return Err(StatusCode::CONFLICT);
-    }
-
     let reviewed = state
         .repo
         .review_attendance_request(
@@ -600,12 +680,47 @@ async fn approve_attendance_request(
         .await
         .map_err(repo_error_to_status)?;
 
-    let (before_punch, updated_punch) = apply_correction_request(&state.repo, &request).await?;
+    let applied_event_id = match request.request_type {
+        AttendanceRequestType::Correction => {
+            let (before_punch, updated_punch) =
+                apply_correction_request(&state.repo, &request).await?;
+            append_punch_update_audit(&state, &admin, &before_punch, &updated_punch, id).await;
+            updated_punch.id
+        }
+        AttendanceRequestType::MissingIn | AttendanceRequestType::MissingOut => {
+            let punch = create_missing_punch(&state.repo, &request).await?;
+            if let Err(e) = state
+                .repo
+                .append(NewAuditLog {
+                    actor_type: "admin".to_string(),
+                    actor_id: Some(admin.id.to_string()),
+                    action: "punch.create_manual".to_string(),
+                    target_type: "punch_event".to_string(),
+                    target_id: Some(punch.id.to_string()),
+                    before_json: None,
+                    after_json: serde_json::to_string(&punch).ok(),
+                    metadata_json: Some(
+                        serde_json::json!({
+                            "request_type": format!("{:?}", request.request_type),
+                            "attendance_request_id": id,
+                        })
+                        .to_string(),
+                    ),
+                })
+                .await
+            {
+                tracing::error!(error = %e, action = "punch.create_manual", "audit log append failed");
+            }
+            punch.id
+        }
+        _ => return Err(StatusCode::CONFLICT),
+    };
+
     let applied = AttendanceRequestRepository::update_status(
         &*state.repo,
         id,
         AttendanceRequestStatus::Applied,
-        Some(updated_punch.id),
+        Some(applied_event_id),
     )
     .await
     .map_err(repo_error_to_status)?;
@@ -618,11 +733,10 @@ async fn approve_attendance_request(
         &reviewed,
         serde_json::json!({
             "review_note": input.review_note,
-            "applied_event_id": updated_punch.id,
+            "applied_event_id": applied_event_id,
         }),
     )
     .await;
-    append_punch_update_audit(&state, &admin, &before_punch, &updated_punch, id).await;
 
     Ok(Json(applied))
 }
@@ -830,12 +944,60 @@ async fn apply_correction_request(
             event_type: Some(target_event_type),
             occurred_at: Some(corrected_at),
         },
-        "lineworks request approved".to_string(),
+        "admin approved correction".to_string(),
     )
     .await
     .map_err(repo_error_to_status)?;
 
     Ok((before_punch, updated_punch))
+}
+
+#[derive(Deserialize)]
+struct MissingPunchPayload {
+    time: String,
+}
+
+async fn create_missing_punch(
+    repo: &SqliteRepository,
+    request: &AttendanceRequest,
+) -> Result<PunchEvent, StatusCode> {
+    let payload: MissingPunchPayload = serde_json::from_str(&request.requested_payload_json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let time = parse_hhmm_time(&payload.time).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let event_type = match request.request_type {
+        AttendanceRequestType::MissingIn => PunchEventType::ClockIn,
+        AttendanceRequestType::MissingOut => PunchEventType::ClockOut,
+        _ => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+
+    let card_id = CardRepository::find_by_employee(repo, request.employee_id)
+        .await
+        .map_err(repo_error_to_status)?
+        .map(|c| c.id);
+
+    let occurred_at = request
+        .requested_at
+        .date()
+        .at(time.0, time.1, 0, 0)
+        .in_tz("Asia/Tokyo")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let event = PunchRepository::insert(
+        repo,
+        NewPunchEvent {
+            id: uuid::Uuid::now_v7(),
+            employee_id: request.employee_id,
+            card_id,
+            event_type,
+            occurred_at,
+            source: "lineworks".to_string(),
+        },
+    )
+    .await
+    .map_err(repo_error_to_status)?;
+
+    Ok(event)
 }
 
 async fn append_attendance_request_audit(
@@ -846,7 +1008,7 @@ async fn append_attendance_request_audit(
     after: &AttendanceRequest,
     metadata: serde_json::Value,
 ) {
-    let _ = state
+    if let Err(e) = state
         .repo
         .append(NewAuditLog {
             actor_type: "admin".to_string(),
@@ -858,7 +1020,10 @@ async fn append_attendance_request_audit(
             after_json: serde_json::to_string(after).ok(),
             metadata_json: Some(metadata.to_string()),
         })
-        .await;
+        .await
+    {
+        tracing::error!(error = %e, action = action, "audit log append failed");
+    }
 }
 
 async fn append_punch_update_audit(
@@ -868,7 +1033,7 @@ async fn append_punch_update_audit(
     after: &PunchEvent,
     request_id: Uuid,
 ) {
-    let _ = state
+    if let Err(e) = state
         .repo
         .append(NewAuditLog {
             actor_type: "admin".to_string(),
@@ -886,7 +1051,10 @@ async fn append_punch_update_audit(
                 .to_string(),
             ),
         })
-        .await;
+        .await
+    {
+        tracing::error!(error = %e, action = "punch.update", "audit log append failed");
+    }
 }
 
 #[derive(Deserialize)]
@@ -1373,7 +1541,7 @@ mod tests {
         );
         assert_eq!(
             punch_row.get::<Option<String>, _>("correction_reason"),
-            Some("lineworks request approved".to_string())
+            Some("admin approved correction".to_string())
         );
 
         let audit_rows =

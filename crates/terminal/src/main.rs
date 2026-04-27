@@ -1,5 +1,6 @@
 mod api_client;
 mod offline;
+mod punch;
 mod rcs380;
 mod reader;
 
@@ -33,20 +34,80 @@ async fn resolve_card(
     state: State<'_, AppState>,
     card_id: String,
 ) -> Result<api_client::CardScannedResponse, String> {
-    state
-        .api_client
-        .resolve_card(&card_id)
-        .await
-        .map_err(|e| e.to_string())
+    match state.api_client.resolve_card(&card_id).await {
+        Ok(response) => {
+            if let api_client::CardScannedResponse::Registered(ref data) = response {
+                let cached = offline::CachedCard {
+                    card_id: card_id.clone(),
+                    employee_id: data.employee.id,
+                    employee_name: data.employee.display_name.clone(),
+                    suggested_type: format!("{:?}", data.suggested_type),
+                    recent_events_json: serde_json::to_string(&data.recent_events)
+                        .unwrap_or_else(|_| "[]".to_string()),
+                    cached_at: jiff::Zoned::now(),
+                };
+                let _ = state.offline_repo.cache_card(&cached).await;
+            }
+            Ok(response)
+        }
+        Err(_) => {
+            tracing::info!(card_id = %card_id, "server unreachable, falling back to local cache");
+            match state.offline_repo.find_cached_card(&card_id).await {
+                Ok(Some(cached)) => {
+                    let recent_events: Vec<pasori_core::domain::punch::PunchEvent> =
+                        serde_json::from_str(&cached.recent_events_json).unwrap_or_default();
+                    let suggested_type = match cached.suggested_type.as_str() {
+                        "ClockIn" => pasori_core::port::policy::PunchEventType::ClockIn,
+                        "ClockOut" => pasori_core::port::policy::PunchEventType::ClockOut,
+                        _ => pasori_core::port::policy::PunchEventType::ClockIn,
+                    };
+                    Ok(api_client::CardScannedResponse::Registered(Box::new(
+                        api_client::RegisteredCardScanResponse {
+                            employee: pasori_core::domain::employee::Employee {
+                                id: cached.employee_id,
+                                display_name: cached.employee_name,
+                                employment_type: String::new(),
+                                affiliation: None,
+                                is_active: true,
+                                note: None,
+                                created_at: cached.cached_at.clone(),
+                                updated_at: cached.cached_at,
+                            },
+                            recent_events,
+                            suggested_type,
+                        },
+                    )))
+                }
+                Ok(None) => Ok(api_client::CardScannedResponse::Unregistered {
+                    card_id: card_id.clone(),
+                }),
+                Err(e) => {
+                    tracing::warn!(error = %e, "local cache lookup failed");
+                    Err(
+                        "サーバーに接続できず、ローカルキャッシュにも情報がありません。"
+                            .to_string(),
+                    )
+                }
+            }
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct SubmitPunchParams {
+    pub card_id: String,
+    pub event_type: pasori_core::port::policy::PunchEventType,
 }
 
 #[tauri::command]
 async fn submit_punch(
     state: State<'_, AppState>,
-    req: api_client::SubmitPunchRequest,
+    params: SubmitPunchParams,
 ) -> Result<pasori_core::domain::punch::PunchEvent, String> {
-    // 1. Save to local cache first (robustness)
+    let req = punch::create_punch_request(params.card_id.clone(), params.event_type);
     let punch_id = req.punch_id;
+
+    // 1. Save to local cache first (robustness)
     state
         .offline_repo
         .save_punch(
@@ -59,7 +120,7 @@ async fn submit_punch(
         .await
         .map_err(|e| format!("failed to save local cache: {}", e))?;
 
-    // 2. Try to submit to server
+    // 2. Try to submit to server with source "nfc"
     match state.api_client.submit_punch(req.clone()).await {
         Ok(event) => {
             // Success! Mark as synced
@@ -73,14 +134,22 @@ async fn submit_punch(
             // Failed (offline?), but it's okay because it's in the cache.
             tracing::warn!(error = %e, "failed to submit punch to server, will retry later");
 
-            // Return a "pending" event so UI can proceed
+            let employee_id = state
+                .offline_repo
+                .find_cached_card(&req.card_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|c| c.employee_id)
+                .unwrap_or(Uuid::nil());
+
             Ok(pasori_core::domain::punch::PunchEvent {
                 id: punch_id,
-                employee_id: Uuid::nil(), // Unknown yet
+                employee_id,
                 card_id: None,
                 event_type: req.event_type,
                 occurred_at: req.occurred_at.clone(),
-                server_recorded_at: req.occurred_at.clone(), // Placeholder
+                server_recorded_at: req.occurred_at.clone(),
                 source: "local_cached".to_string(),
                 correction_reason: None,
                 deleted_at: None,
@@ -180,13 +249,12 @@ async fn main() -> Result<()> {
                                     "ClockOut" => pasori_core::port::policy::PunchEventType::ClockOut,
                                     _ => continue, // Skip unknown for now
                                 };
-                                let req = api_client::SubmitPunchRequest {
-                                    punch_id: punch.id,
-                                    card_id: punch.card_id,
+                                let req = punch::create_offline_punch_request(
+                                    punch.id,
+                                    punch.card_id,
                                     event_type,
-                                    occurred_at: punch.occurred_at,
-                                    source: punch.source,
-                                };
+                                    punch.occurred_at,
+                                );
                                 match api_client_for_setup.submit_punch(req).await {
                                     Ok(_) => {
                                         let _ = offline_repo_for_setup.mark_as_synced(punch.id, &jiff::Zoned::now()).await;

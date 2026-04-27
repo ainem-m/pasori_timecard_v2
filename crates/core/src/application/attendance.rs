@@ -826,6 +826,12 @@ mod tests {
         async fn find(&self, _: &CardId) -> Result<Option<crate::domain::card::Card>, RepoError> {
             Ok(self.card.clone())
         }
+        async fn find_by_employee(
+            &self,
+            _: Uuid,
+        ) -> Result<Option<crate::domain::card::Card>, RepoError> {
+            Ok(self.card.clone())
+        }
         async fn bind(&self, _: &CardId, _: Uuid) -> Result<crate::domain::card::Card, RepoError> {
             unimplemented!()
         }

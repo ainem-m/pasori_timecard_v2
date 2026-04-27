@@ -734,6 +734,16 @@ impl CardRepository for SqliteRepository {
         row.map(map_card_row).transpose()
     }
 
+    async fn find_by_employee(&self, employee_id: Uuid) -> Result<Option<Card>, RepoError> {
+        let row = sqlx::query("SELECT * FROM card WHERE employee_id = ? AND is_active = 1")
+            .bind(employee_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(to_repo_error)?;
+
+        row.map(map_card_row).transpose()
+    }
+
     async fn bind(&self, card_id: &CardId, employee_id: Uuid) -> Result<Card, RepoError> {
         let id = Uuid::now_v7();
         let now = Zoned::now();
@@ -1917,5 +1927,64 @@ INSERT INTO card (
             .hash_password(password.as_bytes(), &salt)
             .expect("hash password")
             .to_string()
+    }
+
+    #[tokio::test]
+    // audit_log の UPDATE はトリガーで禁止される。
+    async fn prevents_audit_log_update() {
+        let pool = setup_db().await;
+        let repo = SqliteRepository::new(pool.clone());
+
+        repo.append(NewAuditLog {
+            actor_type: "system".to_string(),
+            actor_id: None,
+            action: "test.action".to_string(),
+            target_type: "test".to_string(),
+            target_id: None,
+            before_json: None,
+            after_json: None,
+            metadata_json: None,
+        })
+        .await
+        .expect("append audit log");
+
+        let result =
+            sqlx::query("UPDATE audit_log SET action = 'tampered' WHERE action = 'test.action'")
+                .execute(&pool)
+                .await;
+
+        assert!(
+            result.is_err(),
+            "UPDATE on audit_log should be prohibited by trigger"
+        );
+    }
+
+    #[tokio::test]
+    // audit_log の DELETE はトリガーで禁止される。
+    async fn prevents_audit_log_delete() {
+        let pool = setup_db().await;
+        let repo = SqliteRepository::new(pool.clone());
+
+        repo.append(NewAuditLog {
+            actor_type: "system".to_string(),
+            actor_id: None,
+            action: "test.action".to_string(),
+            target_type: "test".to_string(),
+            target_id: None,
+            before_json: None,
+            after_json: None,
+            metadata_json: None,
+        })
+        .await
+        .expect("append audit log");
+
+        let result = sqlx::query("DELETE FROM audit_log WHERE action = 'test.action'")
+            .execute(&pool)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "DELETE on audit_log should be prohibited by trigger"
+        );
     }
 }

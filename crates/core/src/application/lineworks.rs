@@ -1,5 +1,6 @@
 use jiff::Zoned;
 use jiff::civil::Date;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineworksCommand {
@@ -31,6 +32,31 @@ pub enum CorrectionTarget {
 pub struct ClockTime {
     hour: u8,
     minute: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessEventOutcome {
+    NoAction,
+    HelpSent,
+    TodayAttendanceSent,
+    MonthAttendanceSent,
+    TodayShiftSent,
+    MonthShiftSent,
+    UnregisteredUser,
+    RequestCreated {
+        request_id: Uuid,
+    },
+    AutoApproved {
+        request_id: Uuid,
+        punch_id: Uuid,
+        request_type: AttendanceRequestType,
+    },
+}
+
+impl ProcessEventOutcome {
+    pub fn is_auto_approved(&self) -> bool {
+        matches!(self, Self::AutoApproved { .. })
+    }
 }
 
 impl ClockTime {
@@ -80,14 +106,16 @@ pub fn parse_lineworks_command(input: &str) -> LineworksCommand {
     }
 }
 
+use crate::domain::punch::NewPunchEvent;
 use crate::domain::request::{
     AttendanceRequestSource, AttendanceRequestStatus, AttendanceRequestType, NewAttendanceRequest,
 };
 use crate::domain::time::{CutoffDay, CutoffRule, YearMonth};
 use crate::port::notify::{Notifier, NotifyEvent};
-use crate::port::policy::NoRounding;
+use crate::port::policy::{NoRounding, PunchEventType};
 use crate::port::repo::{
-    AttendanceRequestRepository, ExternalAccountRepository, PunchRepository, ShiftRepository,
+    AttendanceRequestRepository, CardRepository, ExternalAccountRepository, PunchRepository,
+    ShiftRepository,
 };
 use std::sync::Arc;
 
@@ -96,6 +124,7 @@ pub struct LineworksUseCase {
     request_repo: Arc<dyn AttendanceRequestRepository>,
     punch_repo: Arc<dyn PunchRepository>,
     shift_repo: Arc<dyn ShiftRepository>,
+    card_repo: Arc<dyn CardRepository>,
     notifier: Arc<dyn Notifier>,
 }
 
@@ -105,6 +134,7 @@ impl LineworksUseCase {
         request_repo: Arc<dyn AttendanceRequestRepository>,
         punch_repo: Arc<dyn PunchRepository>,
         shift_repo: Arc<dyn ShiftRepository>,
+        card_repo: Arc<dyn CardRepository>,
         notifier: Arc<dyn Notifier>,
     ) -> Self {
         Self {
@@ -112,6 +142,7 @@ impl LineworksUseCase {
             request_repo,
             punch_repo,
             shift_repo,
+            card_repo,
             notifier,
         }
     }
@@ -121,7 +152,7 @@ impl LineworksUseCase {
         external_user_id: &str,
         command: LineworksCommand,
         requested_at: &Zoned,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<ProcessEventOutcome> {
         let external_account = self
             .external_repo
             .find_by_external_id("lineworks", external_user_id)
@@ -136,7 +167,7 @@ impl LineworksUseCase {
                         .to_string(),
                 })
                 .await?;
-            return Ok(());
+            return Ok(ProcessEventOutcome::UnregisteredUser);
         };
 
         match command {
@@ -148,6 +179,7 @@ impl LineworksUseCase {
                             .to_string(),
                     })
                     .await?;
+                Ok(ProcessEventOutcome::HelpSent)
             }
             LineworksCommand::TodayAttendance => {
                 let today = requested_at.date();
@@ -178,6 +210,7 @@ impl LineworksUseCase {
                         text: message,
                     })
                     .await?;
+                Ok(ProcessEventOutcome::TodayAttendanceSent)
             }
             LineworksCommand::MonthAttendance => {
                 let today = requested_at.date();
@@ -216,6 +249,7 @@ impl LineworksUseCase {
                         text: message,
                     })
                     .await?;
+                Ok(ProcessEventOutcome::MonthAttendanceSent)
             }
             LineworksCommand::MissingIn { time } | LineworksCommand::MissingOut { time } => {
                 let request_type = if matches!(command, LineworksCommand::MissingIn { .. }) {
@@ -238,7 +272,8 @@ impl LineworksUseCase {
                     "time": format!("{:02}:{:02}", time.hour(), time.minute()),
                 });
 
-                self.request_repo
+                let request = self
+                    .request_repo
                     .create(NewAttendanceRequest {
                         employee_id: account.employee_id,
                         request_type,
@@ -248,6 +283,42 @@ impl LineworksUseCase {
                         requested_at: requested_at.clone(),
                     })
                     .await?;
+
+                let mut punch_id: Option<Uuid> = None;
+
+                if status == AttendanceRequestStatus::AutoApproved {
+                    let event_type = match request_type {
+                        AttendanceRequestType::MissingIn => PunchEventType::ClockIn,
+                        AttendanceRequestType::MissingOut => PunchEventType::ClockOut,
+                        _ => unreachable!(),
+                    };
+                    let occurred_at = build_punch_time(requested_at.date(), time)?;
+                    let card_id = self
+                        .card_repo
+                        .find_by_employee(account.employee_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|c| c.id);
+
+                    let punch = self
+                        .punch_repo
+                        .insert(NewPunchEvent {
+                            id: Uuid::now_v7(),
+                            employee_id: account.employee_id,
+                            card_id,
+                            event_type,
+                            occurred_at: occurred_at.clone(),
+                            source: "lineworks".to_string(),
+                        })
+                        .await?;
+
+                    punch_id = Some(punch.id);
+
+                    self.request_repo
+                        .update_status(request.id, AttendanceRequestStatus::Applied, Some(punch.id))
+                        .await?;
+                }
 
                 let response_text = if status == AttendanceRequestStatus::AutoApproved {
                     "申請を自動承認し、反映しました。".to_string()
@@ -261,6 +332,20 @@ impl LineworksUseCase {
                         text: response_text,
                     })
                     .await?;
+
+                if status == AttendanceRequestStatus::AutoApproved {
+                    Ok(ProcessEventOutcome::AutoApproved {
+                        request_id: request.id,
+                        punch_id: punch_id.ok_or_else(|| {
+                            anyhow::anyhow!("punch_id missing after auto-approval")
+                        })?,
+                        request_type,
+                    })
+                } else {
+                    Ok(ProcessEventOutcome::RequestCreated {
+                        request_id: request.id,
+                    })
+                }
             }
             LineworksCommand::TodayShift => {
                 let today = requested_at.date();
@@ -296,6 +381,7 @@ impl LineworksUseCase {
                         text: message,
                     })
                     .await?;
+                Ok(ProcessEventOutcome::TodayShiftSent)
             }
             LineworksCommand::MonthShift => {
                 let today = requested_at.date();
@@ -332,6 +418,7 @@ impl LineworksUseCase {
                         text: message,
                     })
                     .await?;
+                Ok(ProcessEventOutcome::MonthShiftSent)
             }
             LineworksCommand::Correction { date, target, time } => {
                 let from = day_start_in_tokyo(date).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -402,10 +489,12 @@ impl LineworksUseCase {
                         text: response_text,
                     })
                     .await?;
+
+                Ok(ProcessEventOutcome::RequestCreated {
+                    request_id: request.id,
+                })
             }
         }
-
-        Ok(())
     }
 }
 
@@ -495,6 +584,17 @@ fn build_corrected_time(base: &Zoned, time: ClockTime) -> anyhow::Result<Zoned> 
         )
         .in_tz("Asia/Tokyo")
         .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn build_punch_time(date: Date, time: ClockTime) -> anyhow::Result<Zoned> {
+    date.at(
+        i8::try_from(time.hour()).map_err(|e| anyhow::anyhow!("{e}"))?,
+        i8::try_from(time.minute()).map_err(|e| anyhow::anyhow!("{e}"))?,
+        0,
+        0,
+    )
+    .in_tz("Asia/Tokyo")
+    .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn calculate_correction_delta_minutes(
@@ -727,6 +827,7 @@ mod tests {
             request_repo,
             punch_repo,
             shift_repo,
+            Arc::new(MockCardRepo { card: None }),
             notifier.clone(),
         );
 
@@ -786,6 +887,7 @@ mod tests {
             request_repo,
             punch_repo,
             shift_repo,
+            Arc::new(MockCardRepo { card: None }),
             notifier.clone(),
         );
 
@@ -880,6 +982,7 @@ mod tests {
             request_repo,
             punch_repo,
             shift_repo,
+            Arc::new(MockCardRepo { card: None }),
             notifier.clone(),
         );
 
@@ -941,6 +1044,7 @@ mod tests {
             request_repo.clone(),
             punch_repo.clone(),
             shift_repo,
+            Arc::new(MockCardRepo { card: None }),
             notifier.clone(),
         );
 
@@ -1043,6 +1147,7 @@ mod tests {
             request_repo.clone(),
             punch_repo.clone(),
             shift_repo,
+            Arc::new(MockCardRepo { card: None }),
             notifier.clone(),
         );
 
@@ -1084,9 +1189,215 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    // 当日 出勤忘れ 08:30 は punch_event を作成して applied になる。
+    async fn creates_punch_event_for_auto_approved_missing_in() {
+        let employee_id = uuid::Uuid::now_v7();
+        let card_id = uuid::Uuid::now_v7();
+        let external_repo = Arc::new(MockExternalRepo {
+            account: Some(crate::domain::employee::ExternalAccount {
+                id: uuid::Uuid::now_v7(),
+                employee_id,
+                provider: "lineworks".to_string(),
+                external_user_id: "user-1".to_string(),
+                external_domain_id: None,
+                is_verified: true,
+                created_at: tokyo_datetime(2026, 4, 16, 0, 0),
+                updated_at: tokyo_datetime(2026, 4, 16, 0, 0),
+            }),
+        });
+        let request_repo = Arc::new(MockRequestRepo::default());
+        let punch_repo = Arc::new(MockPunchRepo::default());
+        let shift_repo = Arc::new(MockShiftRepo);
+        let card_repo = Arc::new(MockCardRepo {
+            card: Some(crate::domain::card::Card {
+                id: card_id,
+                employee_id,
+                card_identifier: crate::port::reader::CardId("01ABCDEF".to_string()),
+                card_label: None,
+                is_active: true,
+                created_at: tokyo_datetime(2026, 4, 1, 0, 0),
+                updated_at: tokyo_datetime(2026, 4, 1, 0, 0),
+            }),
+        });
+        let notifier = Arc::new(MockNotifier::default());
+
+        let use_case = super::LineworksUseCase::new(
+            external_repo,
+            request_repo.clone(),
+            punch_repo.clone(),
+            shift_repo,
+            card_repo,
+            notifier.clone(),
+        );
+
+        let requested_at = tokyo_datetime(2026, 4, 16, 8, 30);
+        use_case
+            .process_event(
+                "user-1",
+                super::LineworksCommand::MissingIn {
+                    time: super::ClockTime::new(8, 30).expect("valid time"),
+                },
+                &requested_at,
+            )
+            .await
+            .expect("should process");
+
+        let requests = request_repo.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].request_type,
+            crate::domain::request::AttendanceRequestType::MissingIn
+        );
+        assert_eq!(
+            requests[0].created_status,
+            crate::domain::request::AttendanceRequestStatus::AutoApproved
+        );
+
+        let transitions = request_repo.transitions.lock().await;
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(
+            transitions[0].status,
+            crate::domain::request::AttendanceRequestStatus::Applied
+        );
+        assert!(transitions[0].applied_event_id.is_some());
+
+        let inserts = punch_repo.inserts.lock().await;
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(
+            inserts[0].event_type,
+            crate::port::policy::PunchEventType::ClockIn
+        );
+        assert_eq!(inserts[0].source, "lineworks");
+        assert_eq!(inserts[0].employee_id, employee_id);
+
+        let events = notifier.events.lock().await;
+        assert_eq!(events.len(), 1);
+        if let crate::port::notify::NotifyEvent::LineworksResponse { text, .. } = &events[0] {
+            assert!(text.contains("自動承認し、反映しました"));
+        } else {
+            panic!("unexpected notify event");
+        }
+    }
+
+    #[tokio::test]
+    // 当日 退勤忘れ 18:05 は punch_event を作成して applied になる。
+    async fn creates_punch_event_for_auto_approved_missing_out() {
+        let employee_id = uuid::Uuid::now_v7();
+        let card_id = uuid::Uuid::now_v7();
+        let external_repo = Arc::new(MockExternalRepo {
+            account: Some(crate::domain::employee::ExternalAccount {
+                id: uuid::Uuid::now_v7(),
+                employee_id,
+                provider: "lineworks".to_string(),
+                external_user_id: "user-1".to_string(),
+                external_domain_id: None,
+                is_verified: true,
+                created_at: tokyo_datetime(2026, 4, 16, 0, 0),
+                updated_at: tokyo_datetime(2026, 4, 16, 0, 0),
+            }),
+        });
+        let request_repo = Arc::new(MockRequestRepo::default());
+        let punch_repo = Arc::new(MockPunchRepo::default());
+        let shift_repo = Arc::new(MockShiftRepo);
+        let card_repo = Arc::new(MockCardRepo {
+            card: Some(crate::domain::card::Card {
+                id: card_id,
+                employee_id,
+                card_identifier: crate::port::reader::CardId("01ABCDEF".to_string()),
+                card_label: None,
+                is_active: true,
+                created_at: tokyo_datetime(2026, 4, 1, 0, 0),
+                updated_at: tokyo_datetime(2026, 4, 1, 0, 0),
+            }),
+        });
+        let notifier = Arc::new(MockNotifier::default());
+
+        let use_case = super::LineworksUseCase::new(
+            external_repo,
+            request_repo.clone(),
+            punch_repo.clone(),
+            shift_repo,
+            card_repo,
+            notifier.clone(),
+        );
+
+        let requested_at = tokyo_datetime(2026, 4, 16, 18, 5);
+        use_case
+            .process_event(
+                "user-1",
+                super::LineworksCommand::MissingOut {
+                    time: super::ClockTime::new(18, 5).expect("valid time"),
+                },
+                &requested_at,
+            )
+            .await
+            .expect("should process");
+
+        let inserts = punch_repo.inserts.lock().await;
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(
+            inserts[0].event_type,
+            crate::port::policy::PunchEventType::ClockOut
+        );
+        assert_eq!(inserts[0].source, "lineworks");
+    }
+
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
+    #[derive(Default)]
+    struct MockShiftRepo;
+
+    #[async_trait::async_trait]
+    impl crate::port::repo::ShiftRepository for MockShiftRepo {
+        async fn list_for_month(
+            &self,
+            _: uuid::Uuid,
+            _: crate::domain::time::YearMonth,
+        ) -> Result<Vec<crate::domain::shift::ShiftAssignment>, crate::port::repo::RepoError>
+        {
+            Ok(vec![])
+        }
+        async fn list_types(
+            &self,
+        ) -> Result<Vec<crate::domain::shift::ShiftType>, crate::port::repo::RepoError> {
+            Ok(vec![])
+        }
+    }
+
+    struct MockCardRepo {
+        card: Option<crate::domain::card::Card>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::port::repo::CardRepository for MockCardRepo {
+        async fn find(
+            &self,
+            _: &crate::port::reader::CardId,
+        ) -> Result<Option<crate::domain::card::Card>, crate::port::repo::RepoError> {
+            Ok(self.card.clone())
+        }
+        async fn find_by_employee(
+            &self,
+            _: uuid::Uuid,
+        ) -> Result<Option<crate::domain::card::Card>, crate::port::repo::RepoError> {
+            Ok(self.card.clone())
+        }
+        async fn bind(
+            &self,
+            _: &crate::port::reader::CardId,
+            _: uuid::Uuid,
+        ) -> Result<crate::domain::card::Card, crate::port::repo::RepoError> {
+            unimplemented!()
+        }
+        async fn unbind(
+            &self,
+            _: &crate::port::reader::CardId,
+        ) -> Result<(), crate::port::repo::RepoError> {
+            unimplemented!()
+        }
+    }
     #[derive(Default)]
     struct MockNotifier {
         events: Mutex<Vec<crate::port::notify::NotifyEvent>>,
@@ -1218,6 +1529,7 @@ mod tests {
     #[derive(Default)]
     struct MockPunchRepo {
         punches: Vec<crate::domain::punch::PunchEvent>,
+        inserts: Mutex<Vec<crate::domain::punch::NewPunchEvent>>,
         updates: Mutex<Vec<RecordedPunchUpdate>>,
     }
 
@@ -1228,9 +1540,24 @@ mod tests {
     impl crate::port::repo::PunchRepository for MockPunchRepo {
         async fn insert(
             &self,
-            _: crate::domain::punch::NewPunchEvent,
+            event: crate::domain::punch::NewPunchEvent,
         ) -> Result<crate::domain::punch::PunchEvent, crate::port::repo::RepoError> {
-            unimplemented!()
+            let now = jiff::Zoned::now();
+            let punch = crate::domain::punch::PunchEvent {
+                id: event.id,
+                employee_id: event.employee_id,
+                card_id: event.card_id,
+                event_type: event.event_type,
+                occurred_at: event.occurred_at.clone(),
+                server_recorded_at: now.clone(),
+                source: event.source.clone(),
+                correction_reason: None,
+                deleted_at: None,
+                created_at: now.clone(),
+                updated_at: now,
+            };
+            self.inserts.lock().await.push(event);
+            Ok(punch)
         }
         async fn recent_for_employee(
             &self,
@@ -1282,24 +1609,6 @@ mod tests {
             _: uuid::Uuid,
             _: String,
         ) -> Result<(), crate::port::repo::RepoError> {
-            unimplemented!()
-        }
-    }
-
-    struct MockShiftRepo;
-    #[async_trait::async_trait]
-    impl crate::port::repo::ShiftRepository for MockShiftRepo {
-        async fn list_for_month(
-            &self,
-            _: uuid::Uuid,
-            _: crate::domain::time::YearMonth,
-        ) -> Result<Vec<crate::domain::shift::ShiftAssignment>, crate::port::repo::RepoError>
-        {
-            unimplemented!()
-        }
-        async fn list_types(
-            &self,
-        ) -> Result<Vec<crate::domain::shift::ShiftType>, crate::port::repo::RepoError> {
             unimplemented!()
         }
     }

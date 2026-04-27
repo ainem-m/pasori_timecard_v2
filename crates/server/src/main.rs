@@ -62,6 +62,7 @@ async fn main() -> Result<()> {
         repo.clone(),
         repo.clone(),
         repo.clone(),
+        repo.clone(),
         notifier.clone(),
     ));
 
@@ -74,6 +75,7 @@ async fn main() -> Result<()> {
             api_router = api_router.merge(lineworks::router(
                 bot_secret.into_bytes(),
                 lineworks_use_case,
+                repo.clone(),
             ));
         }
         Err(_) => {

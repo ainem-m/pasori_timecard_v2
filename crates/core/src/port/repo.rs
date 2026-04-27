@@ -24,6 +24,7 @@ pub trait EmployeeRepository: Send + Sync {
 #[async_trait]
 pub trait CardRepository: Send + Sync {
     async fn find(&self, card_id: &CardId) -> Result<Option<Card>, RepoError>;
+    async fn find_by_employee(&self, employee_id: Uuid) -> Result<Option<Card>, RepoError>;
     async fn bind(&self, card_id: &CardId, employee_id: Uuid) -> Result<Card, RepoError>;
     async fn unbind(&self, card_id: &CardId) -> Result<(), RepoError>;
 }
