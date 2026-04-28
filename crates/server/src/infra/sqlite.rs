@@ -19,6 +19,7 @@ use pasori_core::port::repo::{
     AttendanceRequestRepository, AuditLogRepository, CardRepository, EmployeeRepository,
     ExternalAccountRepository, PunchRepository, RepoError, ShiftRepository,
 };
+use rand::RngCore;
 use sqlx::{Row, sqlite::SqlitePool};
 use uuid::Uuid;
 
@@ -530,21 +531,21 @@ impl SqliteRepository {
     pub async fn create_admin_session(
         &self,
         admin_user_id: Uuid,
-    ) -> Result<(Uuid, Zoned), RepoError> {
-        let session_id = Uuid::now_v7();
+    ) -> Result<(String, Zoned), RepoError> {
+        let session_id = generate_admin_session_token();
         let now = Zoned::now();
         let expires_at = session_expiry_from(&now)?;
 
         sqlx::query(
             r#"
-            INSERT INTO admin_session (id, admin_user_id, expires_at, created_at, last_active_at)
+            INSERT INTO admin_session (id, admin_user_id, issued_at, expires_at, last_active_at)
             VALUES (?, ?, ?, ?, ?)
             "#,
         )
-        .bind(session_id.to_string())
+        .bind(&session_id)
         .bind(admin_user_id.to_string())
-        .bind(expires_at.to_string())
         .bind(now.to_string())
+        .bind(expires_at.to_string())
         .bind(now.to_string())
         .execute(&self.pool)
         .await
@@ -1412,6 +1413,22 @@ fn session_expiry_from(now: &Zoned) -> Result<Zoned, RepoError> {
         .map_err(|e| RepoError::Db(e.to_string()))
 }
 
+fn generate_admin_session_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    encode_hex_lower(&bytes)
+}
+
+fn encode_hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
 fn admin_lockout_until(now: &Zoned) -> Result<Zoned, RepoError> {
     now.clone()
         .checked_add(jiff::SignedDuration::from_mins(15))
@@ -1806,12 +1823,12 @@ INSERT INTO card (
     }
 
     #[tokio::test]
-    // session 利用時は期限だけでなく最終活動時刻も更新する。
+    // UUID ではない random token の session でも認証でき、期限だけでなく最終活動時刻も更新する。
     async fn extends_admin_session_on_authentication() {
         let pool = setup_db().await;
         let repo = SqliteRepository::new(pool.clone());
         let admin_id = Uuid::now_v7();
-        let session_id = Uuid::now_v7();
+        let session_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let now = Zoned::now();
         let expires_at = now
             .checked_add(jiff::SignedDuration::from_hours(1))
@@ -1833,26 +1850,26 @@ INSERT INTO card (
         .expect("insert admin");
 
         sqlx::query(
-            "INSERT INTO admin_session (id, admin_user_id, expires_at, created_at, last_active_at)
+            "INSERT INTO admin_session (id, admin_user_id, issued_at, expires_at, last_active_at)
              VALUES (?, ?, ?, ?, ?)",
         )
-        .bind(session_id.to_string())
+        .bind(session_id)
         .bind(admin_id.to_string())
-        .bind(expires_at.to_string())
         .bind(now.to_string())
+        .bind(expires_at.to_string())
         .bind(now.to_string())
         .execute(&pool)
         .await
         .expect("insert session");
 
         let authenticated = repo
-            .authenticate_admin_session(&session_id.to_string())
+            .authenticate_admin_session(session_id)
             .await
             .expect("authenticate admin");
         assert_eq!(authenticated, Some(AuthenticatedAdmin { id: admin_id }));
 
         let row = sqlx::query("SELECT expires_at, last_active_at FROM admin_session WHERE id = ?")
-            .bind(session_id.to_string())
+            .bind(session_id)
             .fetch_one(&pool)
             .await
             .expect("stored session");
@@ -1865,12 +1882,12 @@ INSERT INTO card (
     }
 
     #[tokio::test]
-    // logout では admin_session を削除できる。
+    // logout では random token の admin_session を削除できる。
     async fn deletes_admin_session() {
         let pool = setup_db().await;
         let repo = SqliteRepository::new(pool.clone());
         let admin_id = Uuid::now_v7();
-        let session_id = Uuid::now_v7();
+        let session_id = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
         let now = Zoned::now();
         let password_hash = hash_password("secret");
 
@@ -1889,30 +1906,30 @@ INSERT INTO card (
         .expect("insert admin");
 
         sqlx::query(
-            "INSERT INTO admin_session (id, admin_user_id, expires_at, created_at, last_active_at)
+            "INSERT INTO admin_session (id, admin_user_id, issued_at, expires_at, last_active_at)
              VALUES (?, ?, ?, ?, ?)",
         )
-        .bind(session_id.to_string())
+        .bind(session_id)
         .bind(admin_id.to_string())
+        .bind(now.to_string())
         .bind(
             session_expiry_from(&now)
                 .expect("session expiry")
                 .to_string(),
         )
         .bind(now.to_string())
-        .bind(now.to_string())
         .execute(&pool)
         .await
         .expect("insert session");
 
         let deleted_admin_id = repo
-            .delete_admin_session(&session_id.to_string())
+            .delete_admin_session(session_id)
             .await
             .expect("delete session");
         assert_eq!(deleted_admin_id, Some(admin_id));
 
         let remaining = sqlx::query("SELECT COUNT(*) AS count FROM admin_session WHERE id = ?")
-            .bind(session_id.to_string())
+            .bind(session_id)
             .fetch_one(&pool)
             .await
             .expect("remaining session count")

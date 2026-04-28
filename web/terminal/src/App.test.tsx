@@ -1,6 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
+
+type TauriEvent<T> = {
+  payload: T
+}
+
+const eventMockState = vi.hoisted(() => ({
+  cardScannedHandler: null as ((event: TauriEvent<string>) => void | Promise<void>) | null,
+}))
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(async (command: string) => {
@@ -27,7 +36,13 @@ vi.mock('@tauri-apps/api/core', () => ({
 }))
 
 vi.mock('@tauri-apps/api/event', () => ({
-  listen: vi.fn(async () => () => {}),
+  listen: vi.fn(async (eventName: string, handler: (event: TauriEvent<string>) => void | Promise<void>) => {
+    if (eventName === 'card-scanned') {
+      eventMockState.cardScannedHandler = handler
+    }
+
+    return () => {}
+  }),
 }))
 
 import App from './App'
@@ -35,12 +50,22 @@ import App from './App'
 describe('Terminal App', () => {
   afterEach(() => {
     vi.clearAllMocks()
+    eventMockState.cardScannedHandler = null
   })
 
   it('打刻待機画面を表示する', () => {
     render(<App />)
 
     expect(screen.getByRole('heading', { name: 'カードをタッチ' })).toBeInTheDocument()
+  })
+
+  it('時刻同期チェックを10分ごとに予約する', () => {
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval')
+
+    render(<App />)
+
+    expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 10 * 60 * 1000)
+    setIntervalSpy.mockRestore()
   })
 
   it('submit_punch 呼び出し時に card_id と event_type のみを渡し、punch_id / occurred_at / source を含めない', async () => {
@@ -64,5 +89,57 @@ describe('Terminal App', () => {
     expect(callArgs.params).not.toHaveProperty('punch_id')
     expect(callArgs.params).not.toHaveProperty('occurred_at')
     expect(callArgs.params).not.toHaveProperty('source')
+  })
+
+  it('時刻同期チェックが失敗したら時刻同期エラー画面を表示する', async () => {
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === 'check_clock_sync') {
+        throw new Error('server unreachable')
+      }
+
+      if (command === 'get_reader_status') {
+        return 'Ready'
+      }
+
+      return null
+    })
+
+    render(<App />)
+
+    expect(await screen.findByRole('heading', { name: '時刻同期エラー' })).toBeInTheDocument()
+    expect(screen.getByText('時刻同期を確認できません。管理者に連絡してください。')).toBeInTheDocument()
+  })
+
+  it('時刻同期エラー中はカードスキャンを無視して打刻を送信しない', async () => {
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === 'check_clock_sync') {
+        return { is_synced: false, offset_seconds: 11 }
+      }
+
+      if (command === 'get_reader_status') {
+        return 'Ready'
+      }
+
+      if (command === 'resolve_card') {
+        return {
+          status: 'registered',
+          employee: { id: 'emp-1', display_name: '山田 太郎' },
+          recent_events: [],
+          suggested_type: 'ClockIn',
+        }
+      }
+
+      return null
+    })
+
+    render(<App />)
+
+    expect(await screen.findByRole('heading', { name: '時刻同期エラー' })).toBeInTheDocument()
+    await waitFor(() => expect(listen).toHaveBeenCalledWith('card-scanned', expect.any(Function)))
+
+    await eventMockState.cardScannedHandler?.({ payload: '0123456789ABCDEF' })
+
+    expect(invoke).not.toHaveBeenCalledWith('resolve_card', expect.anything())
+    expect(invoke).not.toHaveBeenCalledWith('submit_punch', expect.anything())
   })
 })

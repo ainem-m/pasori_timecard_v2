@@ -22,6 +22,7 @@ use pasori_core::domain::request::{
 use pasori_core::domain::time::{CutoffDay, CutoffRule, MonthlyTimesheet, YearMonth};
 use pasori_core::port::policy::NoRounding;
 use pasori_core::port::policy::PunchEventType;
+use pasori_core::port::reader::CardId;
 use pasori_core::port::repo::{
     AttendanceRequestRepository, AuditLogRepository, CardRepository, EmployeeRepository,
     PunchRepository, RepoError,
@@ -71,6 +72,8 @@ pub fn router(repo: Arc<SqliteRepository>) -> Router {
         .route("/admin/attendance/monthly", get(get_monthly_attendance))
         .route("/admin/punches", get(list_punches))
         .route("/admin/audit_logs", get(list_audit_logs))
+        .route("/admin/cards/bind", post(bind_card))
+        .route("/admin/cards/unbind", post(unbind_card))
         .with_state(AdminAppState { repo })
 }
 
@@ -117,6 +120,17 @@ struct CreateTerminalResponse {
 struct RotateTerminalTokenResponse {
     terminal: crate::infra::sqlite::TerminalRecord,
     api_token: String,
+}
+
+#[derive(Deserialize)]
+struct BindCardRequest {
+    card_identifier: String,
+    employee_id: Uuid,
+}
+
+#[derive(Deserialize)]
+struct UnbindCardRequest {
+    card_identifier: String,
 }
 
 #[derive(serde::Serialize)]
@@ -613,6 +627,83 @@ async fn deactivate_terminal(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn bind_card(
+    headers: HeaderMap,
+    State(state): State<AdminAppState>,
+    Json(input): Json<BindCardRequest>,
+) -> Result<(StatusCode, Json<pasori_core::domain::card::Card>), StatusCode> {
+    let admin = authenticate_admin_request(&state, &headers).await?;
+    let card_id = CardId(input.card_identifier);
+    let before = CardRepository::find(&*state.repo, &card_id)
+        .await
+        .map_err(repo_error_to_status)?;
+    let card = CardRepository::bind(&*state.repo, &card_id, input.employee_id)
+        .await
+        .map_err(repo_error_to_status)?;
+    let action = match &before {
+        Some(existing) if existing.employee_id != input.employee_id => "card.rebind",
+        _ => "card.bind",
+    };
+
+    if let Err(e) = state
+        .repo
+        .append(NewAuditLog {
+            actor_type: "admin".to_string(),
+            actor_id: Some(admin.id.to_string()),
+            action: action.to_string(),
+            target_type: "card".to_string(),
+            target_id: Some(card.id.to_string()),
+            before_json: before
+                .as_ref()
+                .and_then(|card| serde_json::to_string(card).ok()),
+            after_json: serde_json::to_string(&card).ok(),
+            metadata_json: None,
+        })
+        .await
+    {
+        tracing::error!(error = %e, action = action, "audit log append failed");
+    }
+
+    Ok((StatusCode::CREATED, Json(card)))
+}
+
+async fn unbind_card(
+    headers: HeaderMap,
+    State(state): State<AdminAppState>,
+    Json(input): Json<UnbindCardRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let admin = authenticate_admin_request(&state, &headers).await?;
+    let card_id = CardId(input.card_identifier);
+    let before = CardRepository::find(&*state.repo, &card_id)
+        .await
+        .map_err(repo_error_to_status)?;
+
+    CardRepository::unbind(&*state.repo, &card_id)
+        .await
+        .map_err(repo_error_to_status)?;
+
+    if let Err(e) = state
+        .repo
+        .append(NewAuditLog {
+            actor_type: "admin".to_string(),
+            actor_id: Some(admin.id.to_string()),
+            action: "card.unbind".to_string(),
+            target_type: "card".to_string(),
+            target_id: before.as_ref().map(|card| card.id.to_string()),
+            before_json: before
+                .as_ref()
+                .and_then(|card| serde_json::to_string(card).ok()),
+            after_json: None,
+            metadata_json: None,
+        })
+        .await
+    {
+        tracing::error!(error = %e, action = "card.unbind", "audit log append failed");
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn get_monthly_attendance(
     headers: HeaderMap,
     State(state): State<AdminAppState>,
@@ -833,7 +924,7 @@ fn extract_admin_session_cookie(headers: &HeaderMap) -> Option<&str> {
 }
 
 fn build_admin_session_cookie(
-    session_id: &Uuid,
+    session_id: &str,
 ) -> Result<HeaderValue, axum::http::header::InvalidHeaderValue> {
     let secure = if cfg!(debug_assertions) {
         ""
@@ -1195,7 +1286,7 @@ mod tests {
     }
 
     #[tokio::test]
-    // 正しい資格情報でログインすると session cookie を返す。
+    // 正しい資格情報でログインすると 256bit random hex の session cookie を返す。
     async fn logs_in_and_sets_admin_session_cookie() {
         let app = test_app().await;
         let body = serde_json::json!({
@@ -1224,6 +1315,15 @@ mod tests {
         assert!(cookie.contains("admin_session="));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Strict"));
+        let token = cookie
+            .split(';')
+            .next()
+            .and_then(|pair| pair.split_once('='))
+            .map(|(_, value)| value)
+            .expect("session cookie value");
+        assert_eq!(token.len(), 64);
+        assert!(token.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert!(Uuid::parse_str(token).is_err());
     }
 
     #[tokio::test]
@@ -1861,6 +1961,101 @@ mod tests {
         assert!(authenticated.is_none());
     }
 
+    #[tokio::test]
+    // 管理者はカードを従業員に紐付けると 201 と作成された card を受け取り、監査ログに card.bind が残る。
+    async fn binds_card_to_employee_and_records_audit() {
+        let (app, pool) = test_app_with_pool().await;
+        let employee_id = Uuid::now_v7();
+        insert_employee(&pool, employee_id).await;
+        let cookie = login_and_extract_cookie(app.clone()).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/cards/bind")
+                    .header(axum::http::header::COOKIE, cookie)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "card_identifier": "03030312A91B9843",
+                            "employee_id": employee_id,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["employee_id"], employee_id.to_string());
+        assert_eq!(json["card_identifier"], "03030312A91B9843");
+        assert_eq!(json["is_active"], true);
+
+        let card_id = json["id"].as_str().expect("card id");
+        let audit_row = sqlx::query(
+            "SELECT action, target_type, target_id FROM audit_log WHERE action = 'card.bind'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("card.bind audit row");
+        assert_eq!(audit_row.get::<String, _>("target_type"), "card");
+        assert_eq!(audit_row.get::<String, _>("target_id"), card_id);
+    }
+
+    #[tokio::test]
+    // 管理者はカード紐付けを解除すると 204 を受け取り、card を inactive にして監査ログに card.unbind を残す。
+    async fn unbinds_card_and_records_audit() {
+        let (app, pool) = test_app_with_pool().await;
+        let employee_id = Uuid::now_v7();
+        let card_id = Uuid::now_v7();
+        insert_employee(&pool, employee_id).await;
+        insert_card_with_identifier(&pool, card_id, employee_id, "04040412A91B9843").await;
+        let cookie = login_and_extract_cookie(app.clone()).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/cards/unbind")
+                    .header(axum::http::header::COOKIE, cookie)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "card_identifier": "04040412A91B9843",
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let card_row = sqlx::query("SELECT is_active FROM card WHERE id = ?")
+            .bind(card_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("card row");
+        assert_eq!(card_row.get::<i64, _>("is_active"), 0);
+
+        let audit_row = sqlx::query(
+            "SELECT action, target_type, target_id FROM audit_log WHERE action = 'card.unbind'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("card.unbind audit row");
+        assert_eq!(audit_row.get::<String, _>("target_type"), "card");
+        assert_eq!(audit_row.get::<String, _>("target_id"), card_id.to_string());
+    }
+
     async fn test_app() -> axum::Router {
         let (app, _pool) = test_app_with_pool().await;
         app
@@ -1948,13 +2143,22 @@ mod tests {
     }
 
     async fn insert_card(pool: &sqlx::SqlitePool, card_id: Uuid, employee_id: Uuid) {
+        insert_card_with_identifier(pool, card_id, employee_id, "02020212A91B9843").await;
+    }
+
+    async fn insert_card_with_identifier(
+        pool: &sqlx::SqlitePool,
+        card_id: Uuid,
+        employee_id: Uuid,
+        card_identifier: &str,
+    ) {
         sqlx::query(
             "INSERT INTO card (id, employee_id, card_identifier, card_label, is_active, created_at, updated_at)
              VALUES (?, ?, ?, NULL, 1, ?, ?)",
         )
         .bind(card_id.to_string())
         .bind(employee_id.to_string())
-        .bind("02020212A91B9843")
+        .bind(card_identifier)
         .bind("2026-04-20T00:00:00+09:00[Asia/Tokyo]")
         .bind("2026-04-20T00:00:00+09:00[Asia/Tokyo]")
         .execute(pool)

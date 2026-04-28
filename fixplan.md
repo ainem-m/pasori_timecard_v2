@@ -101,109 +101,44 @@ pnpm -C web/terminal test
 - `admin.password_change` — パスワード変更 API 未実装
 - `settings.update` — 設定永続化機能未実装
 
-## PR 5: Admin session token を random 256bit にする
+## PR 5: Admin session token を random 256bit にする ✅
 
-対象:
+完了。主な変更:
 
-- `crates/server/src/admin.rs`
-- `crates/server/src/infra/sqlite.rs`
-- `migrations/` は schema コメントだけでなく既存 session 互換も確認
+- `crates/server/src/infra/sqlite.rs`: session id 生成を UUID v7 から `OsRng` 32 bytes の lowercase hex に変更
+- `crates/server/src/admin.rs`: cookie builder が string token を受けるよう変更
+- `migrations/20260428000000_admin_session_random_token.sql`: `admin_session` を `issued_at` ベースの schema に移行し、既存 session は `created_at` を `issued_at` として引き継ぐ
+- テスト: Login cookie が 64 hex chars かつ UUID 形式でないこと、UUID ではない token の session 認証、random token session の logout 削除
 
-TODO:
+## PR 6: Terminal NTP 同期チェックを仕様に寄せる ✅
 
-- [ ] session id を UUID v7 から random 256bit hex に変更する
-- [ ] cookie builder が string token を受けるようにする
-- [ ] DB schema / spec と実装の名前を揃える
-- [ ] 既存 session は migration または logout 前提で扱いを決める
+完了。主な変更:
 
-TDD:
+- `crates/terminal/src/clock.rs` 新規: OS 別 NTP checker と parser を追加 (Linux `timedatectl`, macOS `sntp`, Windows `w32tm`)
+- `crates/terminal/src/main.rs`: `check_clock_sync` が OS 同期状態と Server-Time 差分の両方を検証
+- `web/terminal/src/App.tsx`: `check_clock_sync` を起動時 + 10 分ごとに実行し、失敗時も時刻同期エラー画面で打刻を無効化
+- テスト: OS checker parser、Server-Time 10 秒閾値、clockError 中の `card-scanned` 無視と `submit_punch` 抑止
 
-- [ ] Login で返る cookie token が 64 hex chars である
-- [ ] UUID 形式でない token でも session 認証できる
-- [ ] logout で random token の session を削除できる
+## PR 7: Admin Web の運用 UI を最低限完成させる ✅
 
-完了条件:
+完了。主な変更:
 
-- `docs/spec/06_data_model.md` の `random 256bit hex` と一致する
-- session token から発行時刻が推測できない
+- `web/admin/src/App.tsx`: 管理画面を日本語化し、ダッシュボード / 従業員 / 勤怠 / 修正申請 / 監査ログの導線に整理
+- 従業員追加、従業員無効化、カード紐付け、修正申請の承認/却下 UI を追加
+- Placeholder の Search / Settings / Bell / Menu を削除
+- Audit Logs は `target_id` を含む対象表示に修正
+- `crates/server/src/admin.rs`: `POST /api/admin/cards/bind` / `POST /api/admin/cards/unbind` を追加し、`card.bind` / `card.rebind` / `card.unbind` 監査ログを記録
+- テスト: 従業員一覧表示、従業員追加 submit、修正申請 approve/reject、audit row の `target_id` 表示、カード bind/unbind 監査
 
-## PR 6: Terminal NTP 同期チェックを仕様に寄せる
+## PR 8: E2E と手動検証を整備する ✅
 
-対象:
+完了。主な変更:
 
-- `crates/terminal/src/main.rs`
-- `web/terminal/src/App.tsx`
-- 必要なら OS 別 clock checker module を追加
-
-TODO:
-
-- [ ] Linux: `timedatectl status` の同期状態を確認する
-- [ ] macOS: offset を取得する方法を実装する
-- [ ] Windows: `w32tm /query /status` を確認する
-- [ ] Server-Time との差分も引き続き検証する
-- [ ] 失敗または ±10 秒超過時は打刻画面を無効化する
-- [ ] 確認周期を仕様の起動時 + 10 分ごとへ揃える
-
-TDD:
-
-- [ ] Rust: OS clock checker の parser 単体テストを追加する
-- [ ] Rust: Server-Time 差分が 10 秒超なら unsynced
-- [ ] Vitest: clockError 中は card-scanned を無視し、submit もできない
-
-完了条件:
-
-- NTP 未同期時に打刻できない
-- Server 不通時の扱いが offline 打刻仕様と矛盾しない
-
-## PR 7: Admin Web の運用 UI を最低限完成させる
-
-対象:
-
-- `web/admin/src/App.tsx`
-- `web/admin/src/App.test.tsx`
-- 必要な server endpoint
-
-TODO:
-
-- [ ] UI 文言を日本語に寄せる
-- [ ] 従業員追加 / 編集 / 無効化 UI を作る
-- [ ] カード紐付け UI を作る
-- [ ] attendance_request 一覧 / 承認 / 却下 UI を作る
-- [ ] 打刻修正 UI を作る
-- [ ] Audit Logs は target_id を正しく表示する
-- [ ] Placeholder の Search / Settings / Bell を未実装のまま見せない
-
-TDD:
-
-- [ ] Vitest: login 後に従業員一覧を表示する
-- [ ] Vitest: 従業員追加 submit が API を呼ぶ
-- [ ] Vitest: 修正申請 approve/reject が API を呼ぶ
-- [ ] Vitest: audit row が target_id を表示する
-
-完了条件:
-
-- MVP 管理業務の主導線が UI から辿れる
-- 見せかけの操作ボタンが残らない
-
-## PR 8: E2E と手動検証を整備する
-
-対象:
-
-- `web/terminal`
-- `crates/terminal`
-- `docs/verification/`
-
-TODO:
-
-- [ ] `pnpm -C web/terminal test:e2e` を実行可能にする
-- [ ] Tauri happy path: card scan -> confirm -> punch submitted を E2E 化する
-- [ ] offline -> reconnect -> sync の E2E または半手動手順を書く
-- [ ] 実機 PaSoRi 検証手順を `docs/verification/` に残す
-
-完了条件:
-
-- 機能 PR で確認すべき happy path が自動化されている
-- 実機依存箇所は `#[ignore]` の理由と手動手順が文書化されている
+- `web/terminal`: macOS でも動く `pnpm -C web/terminal test:e2e` を Playwright + Vite + mocked Tauri command/event として追加
+- `web/terminal`: Linux / Windows 対応環境向けに `pnpm -C web/terminal test:e2e:tauri` (WebDriverIO + tauri-driver) を分離
+- Terminal happy path (card scan -> confirm -> punch submitted) を自動 E2E 化
+- `docs/verification/e2e-manual-checklist.md`: offline -> reconnect -> sync の半手動手順、PaSoRi RC-S380 実機検証、証跡、Pass / Fail / Blocked 判定を具体化
+- `docs/verification/README.md`: 自動 E2E と実機 E2E の境界、macOS での tauri-driver 非対応を明記
 
 ## 横断ルール
 

@@ -1,4 +1,5 @@
 mod api_client;
+mod clock;
 mod offline;
 mod punch;
 mod rcs380;
@@ -162,6 +163,7 @@ async fn submit_punch(
 
 #[tauri::command]
 async fn check_clock_sync(state: State<'_, AppState>) -> Result<ClockStatus, String> {
+    let os_clock = clock::check_os_clock_sync();
     let server_time = state
         .api_client
         .health_check()
@@ -173,7 +175,7 @@ async fn check_clock_sync(state: State<'_, AppState>) -> Result<ClockStatus, Str
         (server_time.timestamp().as_second() - local_time.timestamp().as_second()).abs();
 
     Ok(ClockStatus {
-        is_synced: offset_seconds <= 10,
+        is_synced: os_clock.is_synced && clock::is_server_offset_synced(offset_seconds),
         server_time,
         local_time,
         offset_seconds,

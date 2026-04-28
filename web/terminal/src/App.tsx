@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
+import { terminalE2eMocks } from './e2eMocks'
 
 // --- Types ---
 type ReaderStatus = 'Disconnected' | 'Connecting' | 'Ready' | { Error: string };
@@ -57,6 +58,18 @@ const Icons = {
 };
 
 const COUNTDOWN_MAX = 30;
+const CLOCK_SYNC_CHECK_INTERVAL_MS = 10 * 60 * 1000;
+const isE2eMode = import.meta.env.VITE_TERMINAL_E2E === '1' || navigator.webdriver;
+const tauriInvoke: (command: string, args?: Record<string, unknown>) => Promise<unknown> =
+  isE2eMode ? terminalE2eMocks.invoke : invoke;
+const tauriListen: (
+  eventName: string,
+  handler: (event: { payload: string }) => void | Promise<void>,
+) => Promise<() => void> = isE2eMode ? terminalE2eMocks.listen : listen;
+
+if (isE2eMode) {
+  window.__PASORI_TERMINAL_E2E__ = terminalE2eMocks.controls;
+}
 
 function parseReaderStatus(status: string): ReaderStatus {
   if (status === 'Disconnected' || status === 'Connecting' || status === 'Ready') {
@@ -88,21 +101,21 @@ function App() {
   // Sync Check
   const checkSync = useCallback(async () => {
     try {
-      const res = await invoke<ClockStatus>('check_clock_sync');
+      const res = await tauriInvoke('check_clock_sync') as ClockStatus;
       if (!res.is_synced) {
         setClockError(`時刻が同期されていません (差分: ${res.offset_seconds}秒)。管理者に連絡してください。`);
       } else {
         setClockError(null);
       }
     } catch (e) {
-      // Offline fallback: we might not be able to check sync, but let's not block completely if we can't reach server
       console.warn('Clock sync check failed:', e);
+      setClockError('時刻同期を確認できません。管理者に連絡してください。');
     }
   }, []);
 
   useEffect(() => {
     checkSync();
-    const interval = setInterval(checkSync, 60000);
+    const interval = setInterval(checkSync, CLOCK_SYNC_CHECK_INTERVAL_MS);
     return () => clearInterval(interval);
   }, [checkSync]);
 
@@ -110,7 +123,7 @@ function App() {
   useEffect(() => {
     const checkStatus = async () => {
       try {
-        const s = await invoke<string>('get_reader_status');
+        const s = await tauriInvoke('get_reader_status') as string;
         setStatus(parseReaderStatus(s));
       } catch (e) {
         setStatus({ Error: String(e) });
@@ -129,7 +142,7 @@ function App() {
     try {
       const type = overrideType || suggestedType;
       
-      await invoke('submit_punch', {
+      await tauriInvoke('submit_punch', {
         params: {
           card_id: scannedCardIdRef.current,
           event_type: type,
@@ -154,7 +167,7 @@ function App() {
   const scannedCardIdRef = useRef<string>('');
   
   useEffect(() => {
-    const unlisten = listen<string>('card-scanned', async (event) => {
+    const unlisten = tauriListen('card-scanned', async (event) => {
       if (clockError) return;
       
       scannedCardIdRef.current = event.payload;
@@ -162,7 +175,7 @@ function App() {
       setCountdown(null);
       
       try {
-        const res = await invoke<ResolveCardResponse>('resolve_card', { cardId: event.payload });
+        const res = await tauriInvoke('resolve_card', { cardId: event.payload }) as ResolveCardResponse;
         if (res.status === 'registered') {
           const data: RegisteredResponse = {
             employee: res.employee,
