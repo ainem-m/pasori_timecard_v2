@@ -5,7 +5,7 @@ import { terminalE2eMocks } from './e2eMocks'
 
 // --- Types ---
 type ReaderStatus = 'Disconnected' | 'Connecting' | 'Ready' | { Error: string };
-type PunchType = 'ClockIn' | 'ClockOut';
+type PunchType = 'clock_in' | 'clock_out';
 
 interface Employee {
   id: string;
@@ -79,6 +79,14 @@ if (isE2eMode) {
   window.__PASORI_TERMINAL_E2E__ = terminalE2eMocks.controls;
 }
 
+function punchTypeLabel(type: PunchType) {
+  return type === 'clock_in' ? '出勤' : '退勤';
+}
+
+function togglePunchType(type: PunchType) {
+  return type === 'clock_in' ? 'clock_out' : 'clock_in';
+}
+
 function parseReaderStatus(status: string): ReaderStatus {
   if (status === 'Disconnected' || status === 'Connecting' || status === 'Ready') {
     return status;
@@ -94,7 +102,7 @@ function App() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [clockError, setClockError] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState(new Date());
-  const [suggestedType, setSuggestedType] = useState<PunchType>('ClockIn');
+  const [suggestedType, setSuggestedType] = useState<PunchType>('clock_in');
   const [recentActivities, setRecentActivities] = useState<RecentActivity[]>([]);
   
   // Long press handling
@@ -225,7 +233,7 @@ function App() {
 
   // Interaction handlers
   const handleToggleType = () => {
-    setSuggestedType(prev => prev === 'ClockIn' ? 'ClockOut' : 'ClockIn');
+    setSuggestedType(togglePunchType);
     setCountdown(COUNTDOWN_MAX); // Reset countdown on change
   };
 
@@ -426,10 +434,10 @@ function App() {
                   <div 
                     onClick={handleToggleType}
                     className={`cursor-pointer group relative py-10 px-12 rounded-[2.5rem] flex items-center justify-center text-8xl font-black transition-all duration-500 overflow-hidden ${
-                      suggestedType === 'ClockIn' ? 'bg-primary-blue text-white shadow-[0_20px_60px_-15px_rgba(59,130,246,0.5)]' : 'bg-primary-orange text-white shadow-[0_20px_60px_-15px_rgba(249,115,22,0.5)]'
+                      suggestedType === 'clock_in' ? 'bg-primary-blue text-white shadow-[0_20px_60px_-15px_rgba(59,130,246,0.5)]' : 'bg-primary-orange text-white shadow-[0_20px_60px_-15px_rgba(249,115,22,0.5)]'
                     }`}
                   >
-                    {suggestedType === 'ClockIn' ? '出勤' : '退勤'}
+                    {punchTypeLabel(suggestedType)}
                     <div className="absolute inset-0 bg-white/20 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-xl font-bold">
                        TAP TO CHANGE
                     </div>
@@ -471,7 +479,7 @@ function App() {
               onTouchStart={startPress}
               onTouchEnd={endPress}
               className={`flex-1 py-10 rounded-[2.5rem] text-4xl font-black relative overflow-hidden transition-all duration-300 ${isSubmitting ? 'scale-95 opacity-50' : 'hover:scale-[1.02] shadow-2xl'} ${
-                suggestedType === 'ClockIn' ? 'bg-white text-primary-blue' : 'bg-white text-primary-orange'
+                suggestedType === 'clock_in' ? 'bg-white text-primary-blue' : 'bg-white text-primary-orange'
               }`}
             >
                <div 
@@ -488,7 +496,7 @@ function App() {
             <div className="grid grid-cols-5 gap-4">
               {scanResult.data.recent_events.slice(0, 5).map((ev, i) => (
                 <div key={i} className="flex flex-col gap-1">
-                  <span className="text-lg font-black">{ev.event_type === 'ClockIn' ? '出勤' : '退勤'}</span>
+                  <span className="text-lg font-black">{punchTypeLabel(ev.event_type)}</span>
                   <span className="text-xs font-bold opacity-60 font-mono">{new Date(ev.occurred_at).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}</span>
                 </div>
               ))}
@@ -506,7 +514,7 @@ function App() {
           <div className="text-center space-y-4">
             <h2 className="text-8xl font-black tracking-tight">DONE!</h2>
             <p className="text-3xl font-bold opacity-60">
-              {scanResult.employee_name} さん、{scanResult.punch_type === 'ClockIn' ? 'おはようございます' : 'お疲れ様でした'}
+              {scanResult.employee_name} さん、{scanResult.punch_type === 'clock_in' ? 'おはようございます' : 'お疲れ様でした'}
             </p>
           </div>
         </div>

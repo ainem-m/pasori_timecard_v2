@@ -2,7 +2,7 @@ import { $, browser, expect } from '@wdio/globals'
 
 type SubmittedPunch = {
   card_id: string
-  event_type: 'ClockIn' | 'ClockOut'
+  event_type: 'clock_in' | 'clock_out'
 }
 
 declare global {
@@ -59,7 +59,7 @@ describe('打刻端末 mocked scan happy path', () => {
     expect(submittedPunches).toEqual([
       {
         card_id: '0123456789ABCDEF',
-        event_type: 'ClockIn',
+        event_type: 'clock_in',
       },
     ])
   })

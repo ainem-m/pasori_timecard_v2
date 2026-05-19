@@ -435,6 +435,18 @@ mod tests {
                 .get::<String, _>("metadata_json")
                 .contains("terminal_unregistered_card_flow")
         );
+        assert!(
+            !audit
+                .get::<String, _>("metadata_json")
+                .contains("9999999999999999")
+        );
+
+        let after_json = sqlx::query("SELECT after_json FROM audit_log WHERE action = 'card.bind' ORDER BY created_at DESC LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("audit after row")
+            .get::<String, _>("after_json");
+        assert!(!after_json.contains("9999999999999999"));
     }
 
     #[tokio::test]

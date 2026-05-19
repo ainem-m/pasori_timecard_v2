@@ -171,7 +171,14 @@ impl SqliteRepository {
         .bind("card")
         .bind(card.id.to_string())
         .bind(Option::<String>::None)
-        .bind(serde_json::to_string(&card).map_err(|e| RepoError::Db(e.to_string()))?)
+        .bind(
+            serde_json::json!({
+                "id": card.id,
+                "employee_id": employee_id,
+                "is_active": card.is_active,
+            })
+            .to_string(),
+        )
         .bind(
             serde_json::json!({
                 "employee_id": employee_id,

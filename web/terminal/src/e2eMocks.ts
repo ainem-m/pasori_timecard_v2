@@ -4,7 +4,7 @@ type TauriEvent<T> = {
 
 type Listener<T> = (event: TauriEvent<T>) => void | Promise<void>
 
-type PunchType = 'ClockIn' | 'ClockOut'
+type PunchType = 'clock_in' | 'clock_out'
 
 type InvokeArgs = Record<string, unknown> | undefined
 
@@ -22,6 +22,7 @@ const scannedCardId = '0123456789ABCDEF'
 const submittedPunches: SubmittedPunch[] = []
 const boundCards: BoundCard[] = []
 const listeners = new Map<string, Listener<string>[]>()
+let nextResolveStatus: 'registered' | 'unregistered' = 'registered'
 
 function addListener(eventName: string, handler: Listener<string>) {
   const current = listeners.get(eventName) ?? []
@@ -50,16 +51,24 @@ async function invoke(command: string, args?: InvokeArgs) {
   }
 
   if (command === 'resolve_card') {
+    if (nextResolveStatus === 'unregistered') {
+      nextResolveStatus = 'registered'
+      return {
+        status: 'unregistered',
+        card_id: scannedCardId,
+      }
+    }
+
     return {
       status: 'registered',
       employee: { id: 'emp-terminal-e2e-1', display_name: '山田 太郎' },
       recent_events: [
         {
-          event_type: 'ClockOut',
+          event_type: 'clock_out',
           occurred_at: '2026-04-27T18:10:00+09:00[Asia/Tokyo]',
         },
       ],
-      suggested_type: 'ClockIn',
+      suggested_type: 'clock_in',
     }
   }
 
@@ -88,13 +97,13 @@ async function invoke(command: string, args?: InvokeArgs) {
     const params = (args?.params ?? {}) as Partial<SubmittedPunch>
     submittedPunches.push({
       card_id: params.card_id ?? scannedCardId,
-      event_type: params.event_type ?? 'ClockIn',
+      event_type: params.event_type ?? 'clock_in',
     })
 
     return {
       id: '0192a3b4-c5d6-7e8f-90ab-cdef12345678',
       employee_id: 'emp-terminal-e2e-1',
-      event_type: params.event_type ?? 'ClockIn',
+      event_type: params.event_type ?? 'clock_in',
       occurred_at: '2026-04-28T09:00:00+09:00[Asia/Tokyo]',
       source: 'nfc',
     }
@@ -108,11 +117,16 @@ export const terminalE2eMocks = {
   listen: async (eventName: string, handler: Listener<string>) => addListener(eventName, handler),
   controls: {
     emitCardScanned: () => emit('card-scanned', scannedCardId),
+    emitUnregisteredCardScanned: async () => {
+      nextResolveStatus = 'unregistered'
+      await emit('card-scanned', scannedCardId)
+    },
     submittedPunches: () => [...submittedPunches],
     boundCards: () => [...boundCards],
     reset: () => {
       submittedPunches.length = 0
       boundCards.length = 0
+      nextResolveStatus = 'registered'
     },
   },
 }

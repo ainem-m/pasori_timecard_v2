@@ -25,7 +25,7 @@ vi.mock('@tauri-apps/api/core', () => ({
       return {
         id: '0192a3b4-c5d6-7e8f-90ab-cdef12345678',
         employee_id: 'emp-1',
-        event_type: 'ClockIn',
+        event_type: 'clock_in',
         occurred_at: '2026-04-25T09:00:00+09:00[Asia/Tokyo]',
         source: 'nfc',
       }
@@ -74,14 +74,14 @@ describe('Terminal App', () => {
     await invoke('submit_punch', {
       params: {
         card_id: '0123456789ABCDEF',
-        event_type: 'ClockIn',
+        event_type: 'clock_in',
       },
     })
 
     expect(invoke).toHaveBeenCalledWith('submit_punch', {
       params: {
         card_id: '0123456789ABCDEF',
-        event_type: 'ClockIn',
+        event_type: 'clock_in',
       },
     })
 
@@ -125,7 +125,7 @@ describe('Terminal App', () => {
           status: 'registered',
           employee: { id: 'emp-1', display_name: '山田 太郎' },
           recent_events: [],
-          suggested_type: 'ClockIn',
+          suggested_type: 'clock_in',
         }
       }
 
