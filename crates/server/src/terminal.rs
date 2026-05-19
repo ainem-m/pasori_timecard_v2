@@ -202,9 +202,14 @@ async fn submit_punch(
         Ok(terminal) => terminal,
         Err(status) => return Err(status),
     };
+    let employee = match EmployeeRepository::find(&*state.repo, payload.employee_id).await {
+        Ok(Some(employee)) if employee.is_active => employee,
+        Ok(_) => return Err(StatusCode::NOT_FOUND),
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
     let event = NewPunchEvent {
         id: payload.punch_id,
-        employee_id: payload.employee_id,
+        employee_id: employee.id,
         card_id: payload.card_id,
         event_type: payload.event_type,
         occurred_at: payload.occurred_at,
@@ -509,6 +514,40 @@ mod tests {
             .await
             .expect("card row");
         assert_eq!(card.get::<i64, _>("is_active"), 1);
+    }
+
+    #[tokio::test]
+    // 旧 punch API でも無効従業員への打刻は拒否する。
+    async fn rejects_legacy_punch_for_inactive_employee() {
+        let (app, pool) = test_app("terminal-secret").await;
+        sqlx::query("UPDATE employee SET is_active = 0 WHERE id = ?")
+            .bind("0196273c-8b3e-7b92-92a7-d0ddf4828a10")
+            .execute(&pool)
+            .await
+            .expect("deactivate employee");
+        let body = serde_json::json!({
+            "punch_id": Uuid::now_v7(),
+            "employee_id": "0196273c-8b3e-7b92-92a7-d0ddf4828a10",
+            "card_id": null,
+            "event_type": "clock_in",
+            "occurred_at": "2026-04-17T09:00:00+09:00[Asia/Tokyo]",
+            "source": "nfc"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/punches")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer terminal-secret")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
