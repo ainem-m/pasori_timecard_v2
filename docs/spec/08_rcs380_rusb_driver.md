@@ -492,72 +492,66 @@ rusb.workspace = true
 
 **ここが最も独立していて、USB 接続なしでテスト可能。最初に着手する。**
 
-```
-TODO:
-[ ] frame::encode — 空 payload
-[ ] frame::encode — [D6, 2A, 01, 03] で手計算一致
-[ ] frame::decode — ACK フレーム → Ok(None)
-[ ] frame::decode — 正常データフレーム → Ok(Some(payload))
-[ ] frame::decode — round-trip (encode → decode)
-[ ] frame::decode — TooShort エラー
-[ ] frame::decode — InvalidPreamble エラー
-[ ] frame::decode — LengthChecksumMismatch エラー
-[ ] frame::decode — DataChecksumMismatch エラー
-```
+完了済み:
+
+- [x] frame::encode — 空 payload
+- [x] frame::encode — [D6, 2A, 01, 03] で手計算一致
+- [x] frame::decode — ACK フレーム → Ok(None)
+- [x] frame::decode — 正常データフレーム → Ok(Some(payload))
+- [x] frame::decode — round-trip (encode → decode)
+- [x] frame::decode — TooShort エラー
+- [x] frame::decode — InvalidPreamble エラー
+- [x] frame::decode — LengthChecksumMismatch エラー
+- [x] frame::decode — DataChecksumMismatch エラー
 
 ### Phase 2: Transport trait + MockTransport (`transport.rs`)
 
-```
-TODO:
-[ ] Transport trait 定義
-[ ] MockTransport 実装
-[ ] UsbTransport::open — デバイス検索ロジック (実機テストは手動)
-[ ] UsbTransport の send/recv (実機テストは手動)
-```
+完了済み:
+
+- [x] Transport trait 定義
+- [x] MockTransport 実装
+- [x] UsbTransport::open — デバイス検索ロジック (実機テストは手動)
+- [x] UsbTransport の send/recv (実機テストは手動)
 
 ### Phase 3: Chipset コマンド (`chipset.rs`)
 
 **MockTransport を使い、送信バイト列とレスポンス処理をテスト。**
 
-```
-TODO:
-[ ] Chipset::initialize — 正常系 (4 コマンド分の ACK + レスポンスを MockTransport にセット)
-[ ] Chipset::initialize — 途中でエラー → ChipsetError
-[ ] Chipset::felica_polling — カード検出 → Ok(Some(idm_hex))
-[ ] Chipset::felica_polling — カード未検出 → Ok(None)
-[ ] Chipset::shutdown — 正常系
-[ ] initialize → polling → shutdown の統合テスト
-```
+完了済み:
+
+- [x] Chipset::initialize — 正常系 (4 コマンド分の ACK + レスポンスを MockTransport にセット)
+- [x] Chipset::initialize — 途中でエラー → ChipsetError
+- [x] Chipset::felica_polling — カード検出 → Ok(Some(idm_hex))
+- [x] Chipset::felica_polling — カード未検出 → Ok(None)
+- [x] Chipset::shutdown — 正常系
+- [x] initialize → polling → shutdown の統合テスト
 
 ### Phase 4: ReaderBackend 実装 (`rcs380/mod.rs`)
 
-```
-TODO:
-[ ] RCS380ReaderBackend::new — 初期状態は Disconnected
-[ ] subscribe — Receiver を返す
-[ ] (実機テスト) start → status が Ready に遷移
-[ ] (実機テスト) カードタッチで CardScanned イベント受信
-[ ] stop → status が Disconnected に遷移
-```
+完了済み:
+
+- [x] RCS380ReaderBackend::new — 初期状態は Disconnected
+- [x] subscribe — Receiver を返す
+- [x] (実機テスト) start → status が Ready に遷移
+- [x] (実機テスト) カードタッチで CardScanned イベント受信
+- [x] stop → status が Disconnected に遷移
 
 ### Phase 5: ReaderError 拡張 + 自動検出 (`reader.rs`)
 
-```
-TODO:
-[ ] core の ReaderError に Usb / Protocol バリアント追加
-[ ] detect_and_create — RC-S380 接続時は RCS380ReaderBackend
-[ ] detect_and_create — PC/SC リーダー接続時は PcscReaderBackend
-[ ] detect_and_create — 未接続時は NotConnected エラー
-[ ] main.rs をファクトリ呼び出しに変更
-```
+完了済み:
+
+- [x] core の ReaderError に Usb / Protocol バリアント追加
+- [x] detect_and_create — RC-S380 接続時は RCS380ReaderBackend
+- [x] detect_and_create — PC/SC リーダー接続時は PcscReaderBackend
+- [x] detect_and_create — 未接続時は NotConnected エラー
+- [x] main.rs をファクトリ呼び出しに変更
 
 ### Phase 6: iPhone エクスプレスカード対応
 
-```
-TODO:
-[ ] poll_loop の交互ポーリング (0xFFFF / 0x0003)
-[ ] (実機テスト) iPhone の Suica を検出できる
-```
+完了済み:
+
+- [x] poll_loop の交互ポーリング (0xFFFF / 0x0003)
+- [x] (実機テスト) iPhone の Suica を検出できる
 
 ---
 
@@ -565,12 +559,9 @@ TODO:
 
 ### `expect()` の除去
 
-`crates/terminal/src/reader.rs` の `PcscReaderBackend` には `expect()` が
-複数残っている (CLAUDE.md §12 違反)。rusb 実装と合わせて修正する:
-
-- `self.status.lock().expect("status lock")` → `match` or `map_err`
-- `self.handle.lock().expect("handle lock")` → 同上
-- `self.cancel.lock().expect("cancel lock")` → 同上
+`crates/terminal/src/reader.rs` の `PcscReaderBackend` に残っていた
+production path の `expect()` は除去済み。mutex poison 時は `ReaderStatus::Error`
+または `ReaderError::Other` として扱う。
 
 ### ReaderError の Serialize/Deserialize
 

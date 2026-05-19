@@ -5,204 +5,32 @@ import {
   ShieldAlert, 
   LayoutDashboard, 
   Plus, 
-  ChevronRight,
   UserPlus,
   ClipboardCheck,
   CreditCard,
   UserMinus,
-  type LucideIcon,
 } from 'lucide-react';
-import { clsx, type ClassValue } from 'clsx';
-import { twMerge } from 'tailwind-merge';
 import { format } from 'date-fns';
 
-/** Utility for tailwind classes */
-function cn(...inputs: ClassValue[]) {
-  return twMerge(clsx(inputs));
-}
-
-// --- Types ---
-
-interface Employee {
-  id: string;
-  display_name: string;
-  employment_type: string;
-  affiliation?: string;
-  note?: string;
-  is_active: boolean;
-  created_at: string;
-}
-
-interface PunchEvent {
-  id: string;
-  employee_id: string;
-  event_type: 'clock_in' | 'clock_out' | 'break_start' | 'break_end' | 'temporary_out' | 'temporary_return' | 'manual_correction';
-  occurred_at: string;
-  source: string;
-}
-
-interface AuditLog {
-  id: string;
-  actor_type: string;
-  action: string;
-  target_type: string;
-  target_id?: string;
-  created_at: string;
-}
-
-interface LoginFormState {
-  username: string;
-  password: string;
-}
-
-interface AttendanceDay {
-  date: string;
-  events: PunchEvent[];
-  work_minutes: number;
-  has_inconsistency: boolean;
-  status: 'unconfirmed' | 'confirmed' | 'locked';
-}
-
-interface MonthlyAttendance {
-  employee_id: string;
-  year_month: {
-    year: number;
-    month: number;
-  };
-  days: AttendanceDay[];
-  total_work_minutes: number;
-  cutoff_rule:
-    | {
-        type: 'day_of_month';
-        day: number;
-      }
-    | {
-        type: 'end_of_month';
-      };
-  period_start: string;
-  period_end: string;
-}
-
-interface EmployeeFormState {
-  display_name: string;
-  employment_type: string;
-  affiliation: string;
-  note: string;
-}
-
-interface CardBindFormState {
-  card_identifier: string;
-  employee_id: string;
-}
-
-interface AttendanceRequest {
-  id: string;
-  employee_id: string;
-  requested_payload_json?: string;
-  requested_at?: string;
-  target_date?: string;
-  request_type?: string;
-  reason?: string;
-  review_note?: string;
-  status: string;
-  created_at: string;
-}
-
-function formatPunchEventLabel(eventType: PunchEvent['event_type']) {
-  switch (eventType) {
-    case 'clock_in':
-      return '出勤';
-    case 'clock_out':
-      return '退勤';
-    case 'break_start':
-      return '休憩開始';
-    case 'break_end':
-      return '休憩終了';
-    case 'temporary_out':
-      return '一時外出';
-    case 'temporary_return':
-      return '戻り';
-    case 'manual_correction':
-      return '修正';
-  }
-}
-
-function formatMinutes(totalMinutes: number) {
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
-  return `${hours}時間 ${minutes}分`;
-}
-
-function buildCurrentYearMonth() {
-  return format(new Date(), 'yyyy-MM');
-}
-
-function formatAttendanceStatus(status: AttendanceDay['status']) {
-  switch (status) {
-    case 'unconfirmed':
-      return '未確認';
-    case 'confirmed':
-      return '確認済み';
-    case 'locked':
-      return '締め済み';
-  }
-}
-
-function formatAttendanceRequest(request: AttendanceRequest) {
-  let payload: Record<string, unknown> = {};
-  if (request.requested_payload_json) {
-    try {
-      const parsed = JSON.parse(request.requested_payload_json);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        payload = parsed as Record<string, unknown>;
-      }
-    } catch {
-      payload = {};
-    }
-  }
-
-  const payloadDate = typeof payload.date === 'string' ? payload.date : undefined;
-  const payloadReason = typeof payload.reason === 'string' ? payload.reason : undefined;
-  const payloadTime = typeof payload.time === 'string' ? payload.time : undefined;
-  const payloadTarget = typeof payload.target === 'string' ? payload.target : undefined;
-
-  return {
-    targetDate: request.target_date || payloadDate || '-',
-    title: request.request_type || '打刻修正',
-    detail: request.reason || payloadReason || [payloadTarget, payloadTime].filter(Boolean).join(' ') || '理由は未入力です。',
-  };
-}
-
-// --- Components ---
-
-const SidebarItem = ({ icon: Icon, label, active, onClick }: { icon: LucideIcon, label: string, active?: boolean, onClick: () => void }) => (
-  <button 
-    onClick={onClick}
-    className={cn(
-      "flex items-center gap-3 w-full px-4 py-3 rounded-lg transition-all duration-200 group",
-      active 
-        ? "bg-primary/10 text-primary font-medium" 
-        : "text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-    )}
-  >
-    <Icon className={cn("w-5 stealth-5 transition-transform group-hover:scale-110", active && "text-primary")} />
-    <span>{label}</span>
-    {active && <ChevronRight className="ml-auto w-4 h-4" />}
-  </button>
-);
-
-const StatCard = ({ title, value, icon: Icon, trend }: { title: string, value: string | number, icon: LucideIcon, trend?: string }) => (
-  <div className="card p-6 flex items-start justify-between">
-    <div>
-      <p className="text-sm font-medium text-muted-foreground mb-1">{title}</p>
-      <h3 className="text-3xl font-bold tracking-tight">{value}</h3>
-      {trend && <p className="text-xs text-green-500 mt-2 font-medium">{trend}</p>}
-    </div>
-    <div className="p-3 bg-accent rounded-lg">
-      <Icon className="w-6 h-6 text-accent-foreground" />
-    </div>
-  </div>
-);
+import { SidebarItem, StatCard } from './components';
+import {
+  buildCurrentYearMonth,
+  formatAttendanceRequest,
+  formatAttendanceStatus,
+  formatMinutes,
+  formatPunchEventLabel,
+} from './formatters';
+import type {
+  AttendanceRequest,
+  AuditLog,
+  CardBindFormState,
+  Employee,
+  EmployeeFormState,
+  LoginFormState,
+  MonthlyAttendance,
+  PunchEvent,
+} from './types';
+import { cn } from './utils';
 
 // --- Main App ---
 
