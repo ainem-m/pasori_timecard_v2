@@ -177,6 +177,12 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Allows binding an unregistered card to an employee from the terminal",
+          "type": "string",
+          "const": "allow-bind-unregistered-card",
+          "markdownDescription": "Allows binding an unregistered card to an employee from the terminal"
+        },
+        {
           "description": "Allows checking time synchronization with the server",
           "type": "string",
           "const": "allow-check-clock-sync",
@@ -187,6 +193,12 @@
           "type": "string",
           "const": "allow-get-reader-status",
           "markdownDescription": "Allows getting the current NFC reader status"
+        },
+        {
+          "description": "Allows listing active employees for terminal-side card binding",
+          "type": "string",
+          "const": "allow-list-active-employees",
+          "markdownDescription": "Allows listing active employees for terminal-side card binding"
         },
         {
           "description": "Allows resolving a card ID to an employee via the server",

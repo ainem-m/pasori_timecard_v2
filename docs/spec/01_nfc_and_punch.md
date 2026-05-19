@@ -142,10 +142,30 @@ fn decide(recent: &[PunchEventRef], now: &Zoned) -> PunchEventType {
 1. Terminal が Server に問い合わせ → Server は `{ status: "unregistered", card_identifier }` を返す
 2. Server は audit_log に `event = "unregistered_card_detected"` で記録
 3. Server は `Notifier::UnregisteredCardDetected` を非同期発火
-4. Terminal は「このカードは登録されていません。管理者にお問い合わせください」と表示
-5. **Terminal 側で従業員選択ダイアログは出さない** (v1 から意図的に変更)
-6. 管理者は Admin Web の「カード紐付け」画面で、未登録カード一覧からこのカードを選び、従業員に紐付ける
-7. 既に別従業員に紐付け済みのカードを再紐付けする場合は確認ダイアログを表示
+4. Terminal は Server から有効従業員一覧を取得する
+5. Terminal は従業員氏名のみを一覧表示する (MVP 想定 20 人程度のため検索なし)
+6. 操作者が従業員を選択する
+7. Terminal は「このカードを 山田太郎 に登録します」の確認画面を表示する
+8. 確認後、Terminal API token で Server に紐付けを要求する
+9. Server は `card.bind` を audit_log に記録する (`actor_type = "terminal"`)
+10. Terminal は local card cache に保存する
+11. Terminal は「山田太郎に登録しました」と表示し、打刻せず待受に戻る
+12. 直近履歴には「カード登録」を表示する
+
+### Terminal 紐付けの制約
+
+- 操作者認証は挟まない
+- オンライン時のみ実行できる
+- Server 不通時は「しばらくしてもう一度試してください」と表示する
+- 紐付け失敗時は「もう一度試してください」と表示する
+- カード ID は Terminal 画面に表示しない
+- 有効従業員のみ選択できる
+- 既に紐付いたカードは通常打刻し、Terminal から付け替えしない
+- 登録後にそのまま打刻はしない
+- 次回スキャンから打刻可能にする
+- 1 従業員に複数カードを紐付けできる
+- 1 カードは同時に 1 従業員だけに紐付く
+- Admin Web のカード紐付け機能は事前登録・誤登録修正用に残す
 
 ## TDD 対象
 
@@ -155,3 +175,4 @@ AGENTS.md §6 に従い、以下は **必ず** TDD で実装する。
 - 連続スキャン無視ロジック
 - オフライン → オンライン再送の冪等性
 - NTP ずれ判定
+- Terminal 側の未登録カード紐付けフロー

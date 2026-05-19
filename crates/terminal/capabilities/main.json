@@ -13,6 +13,8 @@
     "core:event:allow-emit",
     "allow-get-reader-status",
     "allow-resolve-card",
+    "allow-list-active-employees",
+    "allow-bind-unregistered-card",
     "allow-submit-punch",
     "allow-check-clock-sync"
   ]

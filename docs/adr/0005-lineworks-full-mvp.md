@@ -1,8 +1,11 @@
 # ADR 0005: LINE WORKS 双方向連携を MVP に含める
 
 - **日付**: 2026-04-16
-- **状態**: Accepted
+- **状態**: Superseded by ADR 0014
 - **関連**: ADR 0002 (C プラン), ADR 0003 (MVP スコープ)
+
+> 2026-05-19 追記: LINE WORKS 双方向連携を MVP に含める判断は ADR 0014 で取り消した。
+> LINE WORKS は Phase 2 とし、MVP では既存実装を隠すか未設定時に無効化する。
 
 ## 背景
 

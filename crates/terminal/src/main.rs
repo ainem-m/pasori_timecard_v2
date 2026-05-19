@@ -1,4 +1,5 @@
 mod api_client;
+mod card_binding;
 mod clock;
 mod offline;
 mod punch;
@@ -92,6 +93,51 @@ async fn resolve_card(
             }
         }
     }
+}
+
+#[tauri::command]
+async fn list_active_employees(
+    state: State<'_, AppState>,
+) -> Result<Vec<api_client::TerminalEmployee>, String> {
+    state
+        .api_client
+        .list_active_employees()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[derive(serde::Deserialize)]
+pub struct BindUnregisteredCardParams {
+    pub card_id: String,
+    pub employee_id: Uuid,
+}
+
+#[tauri::command]
+async fn bind_unregistered_card(
+    state: State<'_, AppState>,
+    params: BindUnregisteredCardParams,
+) -> Result<api_client::BindUnregisteredCardResponse, String> {
+    let response = state
+        .api_client
+        .bind_unregistered_card(api_client::BindUnregisteredCardRequest {
+            card_id: params.card_id.clone(),
+            employee_id: params.employee_id,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if let Err(e) = card_binding::cache_bound_card(
+        &state.offline_repo,
+        &params.card_id,
+        response.employee.id,
+        &response.employee.display_name,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "server card binding succeeded but local card cache update failed");
+    }
+
+    Ok(response)
 }
 
 #[derive(serde::Deserialize)]
@@ -222,6 +268,8 @@ async fn main() -> Result<()> {
         .invoke_handler(tauri::generate_handler![
             get_reader_status,
             resolve_card,
+            list_active_employees,
+            bind_unregistered_card,
             submit_punch,
             check_clock_sync
         ])

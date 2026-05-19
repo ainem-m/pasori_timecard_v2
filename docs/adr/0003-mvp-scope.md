@@ -1,7 +1,10 @@
 # ADR 0003: MVP スコープ定義
 
 - **日付**: 2026-04-16
-- **状態**: Accepted
+- **状態**: Superseded by ADR 0014
+
+> 2026-05-19 追記: MVP スコープは ADR 0014 で再定義した。特に LINE WORKS 双方向連携は
+> Phase 2 に移し、MVP は PaSoRi 打刻、Terminal 側カード紐付け、Admin 勤怠確認に絞る。
 
 ## 背景
 

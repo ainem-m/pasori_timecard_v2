@@ -8,10 +8,11 @@ use axum::{
 };
 use pasori_core::application::attendance::RegisteredCardScan;
 use pasori_core::application::attendance::{PunchUseCase, ResolvedCardScan};
+use pasori_core::domain::card::Card;
 use pasori_core::domain::punch::{NewPunchEvent, PunchEvent};
 use pasori_core::port::policy::PunchEventType;
 use pasori_core::port::reader::CardId;
-use pasori_core::port::repo::RepoError;
+use pasori_core::port::repo::{CardRepository, EmployeeRepository, RepoError};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -25,6 +26,8 @@ pub fn router(punch_use_case: Arc<PunchUseCase>, repo: Arc<SqliteRepository>) ->
     Router::new()
         .route("/health", get(health_check))
         .route("/terminals/me/card_scanned", get(card_scanned))
+        .route("/terminals/me/employees", get(list_active_employees))
+        .route("/terminals/me/cards/bind", post(bind_card))
         .route("/terminals/me/punches", post(sync_punch))
         .route("/punches", post(submit_punch))
         .with_state(TerminalAppState {
@@ -59,6 +62,24 @@ struct RegisteredCardScanResponse {
     employee: pasori_core::domain::employee::Employee,
     recent_events: Vec<PunchEvent>,
     suggested_type: PunchEventType,
+}
+
+#[derive(Deserialize)]
+struct BindCardRequest {
+    card_id: String,
+    employee_id: uuid::Uuid,
+}
+
+#[derive(Serialize)]
+struct TerminalEmployee {
+    id: uuid::Uuid,
+    display_name: String,
+}
+
+#[derive(Serialize)]
+struct BindCardResponse {
+    card: Card,
+    employee: TerminalEmployee,
 }
 
 async fn card_scanned(
@@ -98,6 +119,70 @@ async fn card_scanned(
     }
 }
 
+async fn list_active_employees(
+    headers: HeaderMap,
+    State(state): State<TerminalAppState>,
+) -> Result<Json<Vec<TerminalEmployee>>, StatusCode> {
+    let _terminal = authenticate_terminal_request(&state, &headers).await?;
+
+    state
+        .repo
+        .list_active()
+        .await
+        .map(|employees| {
+            Json(
+                employees
+                    .into_iter()
+                    .map(|employee| TerminalEmployee {
+                        id: employee.id,
+                        display_name: employee.display_name,
+                    })
+                    .collect(),
+            )
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn bind_card(
+    headers: HeaderMap,
+    State(state): State<TerminalAppState>,
+    Json(payload): Json<BindCardRequest>,
+) -> Result<(StatusCode, Json<BindCardResponse>), StatusCode> {
+    let terminal = authenticate_terminal_request(&state, &headers).await?;
+    let card_id = CardId(payload.card_id);
+    if let Some(existing) = CardRepository::find(&*state.repo, &card_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        if existing.is_active {
+            return Err(StatusCode::CONFLICT);
+        }
+    }
+
+    let employee = EmployeeRepository::find(&*state.repo, payload.employee_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .filter(|employee| employee.is_active)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let card = state
+        .repo
+        .bind_new_card_from_terminal(&card_id, employee.id, terminal.id)
+        .await
+        .map_err(map_repo_error)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(BindCardResponse {
+            card,
+            employee: TerminalEmployee {
+                id: employee.id,
+                display_name: employee.display_name,
+            },
+        }),
+    ))
+}
+
 #[derive(Deserialize)]
 struct SubmitPunchRequest {
     punch_id: uuid::Uuid,
@@ -117,9 +202,14 @@ async fn submit_punch(
         Ok(terminal) => terminal,
         Err(status) => return Err(status),
     };
+    let employee = match EmployeeRepository::find(&*state.repo, payload.employee_id).await {
+        Ok(Some(employee)) if employee.is_active => employee,
+        Ok(_) => return Err(StatusCode::NOT_FOUND),
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
     let event = NewPunchEvent {
         id: payload.punch_id,
-        employee_id: payload.employee_id,
+        employee_id: employee.id,
         card_id: payload.card_id,
         event_type: payload.event_type,
         occurred_at: payload.occurred_at,
@@ -192,6 +282,14 @@ async fn handle_submit_error(
     Err(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+fn map_repo_error(error: RepoError) -> StatusCode {
+    match error {
+        RepoError::Conflict(_) => StatusCode::CONFLICT,
+        RepoError::NotFound => StatusCode::NOT_FOUND,
+        RepoError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 async fn authenticate_terminal_request(
     state: &TerminalAppState,
     headers: &HeaderMap,
@@ -256,6 +354,262 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    // Terminal token があれば有効な従業員一覧を取得できる。
+    async fn lists_active_employees_for_terminal_binding() {
+        let (app, _pool) = test_app("terminal-secret").await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/terminals/me/employees")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer terminal-secret")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let employees = json.as_array().expect("employees array");
+        assert!(
+            employees
+                .iter()
+                .any(|employee| employee["display_name"] == "テスト 太郎")
+        );
+        assert!(
+            employees
+                .iter()
+                .all(|employee| employee.get("employment_type").is_none())
+        );
+    }
+
+    #[tokio::test]
+    // Terminal は未登録カードを有効従業員に紐付け、terminal actor の監査ログを残す。
+    async fn binds_unregistered_card_from_terminal_and_records_audit() {
+        let (app, pool) = test_app("terminal-secret").await;
+        let body = serde_json::json!({
+            "card_id": "9999999999999999",
+            "employee_id": "0196273c-8b3e-7b92-92a7-d0ddf4828a10"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/terminals/me/cards/bind")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer terminal-secret")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let card = sqlx::query("SELECT employee_id FROM card WHERE card_identifier = ?")
+            .bind("9999999999999999")
+            .fetch_one(&pool)
+            .await
+            .expect("card row");
+        assert_eq!(
+            card.get::<String, _>("employee_id"),
+            "0196273c-8b3e-7b92-92a7-d0ddf4828a10"
+        );
+
+        let audit = sqlx::query(
+            "SELECT actor_type, actor_id, action, metadata_json FROM audit_log WHERE action = 'card.bind' ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("audit row");
+        assert_eq!(audit.get::<String, _>("actor_type"), "terminal");
+        assert_eq!(
+            audit.get::<String, _>("actor_id"),
+            "0196273c-8b3e-7b92-92a7-d0ddf4828a12"
+        );
+        assert!(
+            audit
+                .get::<String, _>("metadata_json")
+                .contains("terminal_unregistered_card_flow")
+        );
+        assert!(
+            !audit
+                .get::<String, _>("metadata_json")
+                .contains("9999999999999999")
+        );
+
+        let after_json = sqlx::query("SELECT after_json FROM audit_log WHERE action = 'card.bind' ORDER BY created_at DESC LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("audit after row")
+            .get::<String, _>("after_json");
+        assert!(!after_json.contains("9999999999999999"));
+    }
+
+    #[tokio::test]
+    // Terminal から既存カードの付け替えはできない。
+    async fn rejects_terminal_rebind_for_existing_active_card() {
+        let (app, _pool) = test_app("terminal-secret").await;
+        let body = serde_json::json!({
+            "card_id": TEST_CARD_ID,
+            "employee_id": "0196273c-8b3e-7b92-92a7-d0ddf4828a10"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/terminals/me/cards/bind")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer terminal-secret")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    // Terminal は無効化済みカードを未登録カードフローで再紐付けできる。
+    async fn reactivates_inactive_card_from_terminal_binding() {
+        let (app, pool) = test_app("terminal-secret").await;
+        sqlx::query("UPDATE card SET is_active = 0 WHERE card_identifier = ?")
+            .bind(TEST_CARD_ID)
+            .execute(&pool)
+            .await
+            .expect("deactivate card");
+        let body = serde_json::json!({
+            "card_id": TEST_CARD_ID,
+            "employee_id": "0196273c-8b3e-7b92-92a7-d0ddf4828a10"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/terminals/me/cards/bind")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer terminal-secret")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let card = sqlx::query("SELECT is_active FROM card WHERE card_identifier = ?")
+            .bind(TEST_CARD_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("card row");
+        assert_eq!(card.get::<i64, _>("is_active"), 1);
+    }
+
+    #[tokio::test]
+    // 旧 punch API でも無効従業員への打刻は拒否する。
+    async fn rejects_legacy_punch_for_inactive_employee() {
+        let (app, pool) = test_app("terminal-secret").await;
+        sqlx::query("UPDATE employee SET is_active = 0 WHERE id = ?")
+            .bind("0196273c-8b3e-7b92-92a7-d0ddf4828a10")
+            .execute(&pool)
+            .await
+            .expect("deactivate employee");
+        let body = serde_json::json!({
+            "punch_id": Uuid::now_v7(),
+            "employee_id": "0196273c-8b3e-7b92-92a7-d0ddf4828a10",
+            "card_id": null,
+            "event_type": "clock_in",
+            "occurred_at": "2026-04-17T09:00:00+09:00[Asia/Tokyo]",
+            "source": "nfc"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/punches")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer terminal-secret")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    // 同じ未登録カードへの同時紐付けは片方だけ成功し、付け替えを起こさない。
+    async fn rejects_concurrent_terminal_bind_for_same_card() {
+        let (app, pool) = test_app("terminal-secret").await;
+        let now = jiff::Zoned::now().to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO employee (id, display_name, employment_type, is_active, created_at, updated_at)
+            VALUES (?, ?, ?, 1, ?, ?)
+            "#,
+        )
+        .bind("0196273c-8b3e-7b92-92a7-d0ddf4828a13")
+        .bind("テスト 花子")
+        .bind("part_time")
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("insert employee");
+
+        let body_a = serde_json::json!({
+            "card_id": "AAAAAAAAAAAAAAAA",
+            "employee_id": "0196273c-8b3e-7b92-92a7-d0ddf4828a10"
+        });
+        let body_b = serde_json::json!({
+            "card_id": "AAAAAAAAAAAAAAAA",
+            "employee_id": "0196273c-8b3e-7b92-92a7-d0ddf4828a13"
+        });
+
+        let request_a = Request::builder()
+            .method("POST")
+            .uri("/terminals/me/cards/bind")
+            .header(axum::http::header::AUTHORIZATION, "Bearer terminal-secret")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body_a.to_string()))
+            .expect("request a");
+        let request_b = Request::builder()
+            .method("POST")
+            .uri("/terminals/me/cards/bind")
+            .header(axum::http::header::AUTHORIZATION, "Bearer terminal-secret")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body_b.to_string()))
+            .expect("request b");
+
+        let (response_a, response_b) =
+            tokio::join!(app.clone().oneshot(request_a), app.oneshot(request_b));
+        let statuses = [
+            response_a.expect("response a").status(),
+            response_b.expect("response b").status(),
+        ];
+
+        assert!(statuses.contains(&StatusCode::CREATED));
+        assert!(statuses.contains(&StatusCode::CONFLICT));
+
+        let cards = sqlx::query("SELECT employee_id FROM card WHERE card_identifier = ?")
+            .bind("AAAAAAAAAAAAAAAA")
+            .fetch_all(&pool)
+            .await
+            .expect("card rows");
+        assert_eq!(cards.len(), 1);
     }
 
     #[tokio::test]
