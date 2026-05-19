@@ -130,29 +130,43 @@ impl SqliteRepository {
     ) -> Result<Card, RepoError> {
         let mut tx = self.pool.begin().await.map_err(to_repo_error)?;
 
-        let card_uuid = Uuid::now_v7();
         let now = Zoned::now();
-        let card_uuid_str = card_uuid.to_string();
         let employee_id_str = employee_id.to_string();
         let now_str = now.to_string();
 
-        sqlx::query(
+        let updated = sqlx::query(
             r#"
-            INSERT INTO card (id, employee_id, card_identifier, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            UPDATE card
+            SET employee_id = ?, is_active = 1, updated_at = ?
+            WHERE card_identifier = ? AND is_active = 0
             "#,
         )
-        .bind(&card_uuid_str)
         .bind(&employee_id_str)
+        .bind(&now_str)
         .bind(&card_id.0)
-        .bind(&now_str)
-        .bind(&now_str)
         .execute(&mut *tx)
         .await
         .map_err(to_repo_error)?;
 
-        let card = sqlx::query("SELECT * FROM card WHERE id = ?")
-            .bind(&card_uuid_str)
+        if updated.rows_affected() == 0 {
+            sqlx::query(
+                r#"
+                INSERT INTO card (id, employee_id, card_identifier, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(&employee_id_str)
+            .bind(&card_id.0)
+            .bind(&now_str)
+            .bind(&now_str)
+            .execute(&mut *tx)
+            .await
+            .map_err(to_repo_error)?;
+        }
+
+        let card = sqlx::query("SELECT * FROM card WHERE card_identifier = ?")
+            .bind(&card_id.0)
             .fetch_one(&mut *tx)
             .await
             .map_err(to_repo_error)

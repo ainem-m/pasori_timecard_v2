@@ -475,6 +475,43 @@ mod tests {
     }
 
     #[tokio::test]
+    // Terminal は無効化済みカードを未登録カードフローで再紐付けできる。
+    async fn reactivates_inactive_card_from_terminal_binding() {
+        let (app, pool) = test_app("terminal-secret").await;
+        sqlx::query("UPDATE card SET is_active = 0 WHERE card_identifier = ?")
+            .bind(TEST_CARD_ID)
+            .execute(&pool)
+            .await
+            .expect("deactivate card");
+        let body = serde_json::json!({
+            "card_id": TEST_CARD_ID,
+            "employee_id": "0196273c-8b3e-7b92-92a7-d0ddf4828a10"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/terminals/me/cards/bind")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer terminal-secret")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let card = sqlx::query("SELECT is_active FROM card WHERE card_identifier = ?")
+            .bind(TEST_CARD_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("card row");
+        assert_eq!(card.get::<i64, _>("is_active"), 1);
+    }
+
+    #[tokio::test]
     // 同じ未登録カードへの同時紐付けは片方だけ成功し、付け替えを起こさない。
     async fn rejects_concurrent_terminal_bind_for_same_card() {
         let (app, pool) = test_app("terminal-secret").await;

@@ -48,45 +48,13 @@ impl PunchUseCase {
         let card = self.card_repo.find(card_id).await?;
 
         let Some(card) = card.filter(|card| card.is_active) else {
-            // 未登録カード
-            let _ = self
-                .audit_repo
-                .append(NewAuditLog {
-                    actor_type: "terminal".to_string(),
-                    actor_id: None,
-                    action: "unregistered_card_detected".to_string(),
-                    target_type: "card".to_string(),
-                    target_id: None,
-                    before_json: None,
-                    after_json: None,
-                    metadata_json: Some(
-                        serde_json::json!({
-                            "card_id": card_id.0,
-                            "detected_at": now.to_string(),
-                        })
-                        .to_string(),
-                    ),
-                })
-                .await;
-
-            let _ = self
-                .notifier
-                .notify(NotifyEvent::UnregisteredCardDetected {
-                    card_id: card_id.clone(),
-                    at: now.clone(),
-                })
-                .await;
-
-            return Ok(ResolvedCardScan::Unregistered {
-                card_id: card_id.clone(),
-            });
+            return self.resolve_unregistered_card_scan(card_id, now).await;
         };
 
-        let employee = self
-            .employee_repo
-            .find(card.employee_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("employee not found for card"))?;
+        let employee = self.employee_repo.find(card.employee_id).await?;
+        let Some(employee) = employee.filter(|employee| employee.is_active) else {
+            return self.resolve_unregistered_card_scan(card_id, now).await;
+        };
 
         let recent_events = self.punch_repo.recent_for_employee(employee.id, 5).await?;
         let recent_refs: Vec<PunchEventRef> = recent_events
@@ -105,6 +73,44 @@ impl PunchUseCase {
             suggested_type,
             card_id: Some(card.id),
         })))
+    }
+
+    async fn resolve_unregistered_card_scan(
+        &self,
+        card_id: &CardId,
+        now: &Zoned,
+    ) -> anyhow::Result<ResolvedCardScan> {
+        let _ = self
+            .audit_repo
+            .append(NewAuditLog {
+                actor_type: "terminal".to_string(),
+                actor_id: None,
+                action: "unregistered_card_detected".to_string(),
+                target_type: "card".to_string(),
+                target_id: None,
+                before_json: None,
+                after_json: None,
+                metadata_json: Some(
+                    serde_json::json!({
+                        "card_id": card_id.0,
+                        "detected_at": now.to_string(),
+                    })
+                    .to_string(),
+                ),
+            })
+            .await;
+
+        let _ = self
+            .notifier
+            .notify(NotifyEvent::UnregisteredCardDetected {
+                card_id: card_id.clone(),
+                at: now.clone(),
+            })
+            .await;
+
+        Ok(ResolvedCardScan::Unregistered {
+            card_id: card_id.clone(),
+        })
     }
 
     /// 打刻の確定処理
@@ -787,57 +793,53 @@ mod tests {
     }
 
     #[tokio::test]
-    // 無効化されたカードのスキャンは登録済みとして扱わず、未登録カードとして返す。
-    async fn resolves_inactive_card_as_unregistered_card_scan() {
-        let employee_id = Uuid::now_v7();
-        let card_id = CardId("0123456789ABCDEF".to_string());
-        let employee_repo = Arc::new(MockEmployeeRepo {
-            employee: Some(Employee {
-                id: employee_id,
-                display_name: "田中 太郎".to_string(),
-                employment_type: "regular".to_string(),
-                affiliation: None,
-                is_active: true,
-                note: None,
-                created_at: tokyo_datetime(2026, 4, 1, 0, 0),
-                updated_at: tokyo_datetime(2026, 4, 1, 0, 0),
-            }),
-        });
-        let card_repo = Arc::new(MockCardRepo {
-            card: Some(crate::domain::card::Card {
-                id: Uuid::now_v7(),
-                employee_id,
-                card_identifier: card_id.clone(),
-                card_label: None,
-                is_active: false,
-                created_at: tokyo_datetime(2026, 4, 1, 0, 0),
-                updated_at: tokyo_datetime(2026, 4, 1, 0, 0),
-            }),
-        });
-        let punch_repo = Arc::new(MockPunchRepo);
-        let audit_repo = Arc::new(MockAuditRepo::default());
-        let notifier = Arc::new(MockNotifier::default());
-        let punch_policy = Arc::new(crate::port::policy::DefaultPunchPolicy);
+    // 無効カードまたは無効従業員のカードは登録済みとして扱わず、未登録カードとして返す。
+    async fn resolves_inactive_card_or_employee_as_unregistered_card_scan() {
+        for (card_is_active, employee_is_active) in [(false, true), (true, false)] {
+            let employee_id = Uuid::now_v7();
+            let card_id = CardId("0123456789ABCDEF".to_string());
+            let employee_repo = Arc::new(MockEmployeeRepo {
+                employee: Some(Employee {
+                    id: employee_id,
+                    display_name: "田中 太郎".to_string(),
+                    employment_type: "regular".to_string(),
+                    affiliation: None,
+                    is_active: employee_is_active,
+                    note: None,
+                    created_at: tokyo_datetime(2026, 4, 1, 0, 0),
+                    updated_at: tokyo_datetime(2026, 4, 1, 0, 0),
+                }),
+            });
+            let card_repo = Arc::new(MockCardRepo {
+                card: Some(crate::domain::card::Card {
+                    id: Uuid::now_v7(),
+                    employee_id,
+                    card_identifier: card_id.clone(),
+                    card_label: None,
+                    is_active: card_is_active,
+                    created_at: tokyo_datetime(2026, 4, 1, 0, 0),
+                    updated_at: tokyo_datetime(2026, 4, 1, 0, 0),
+                }),
+            });
+            let use_case = super::PunchUseCase::new(
+                employee_repo,
+                card_repo,
+                Arc::new(MockPunchRepo),
+                Arc::new(MockAuditRepo::default()),
+                Arc::new(MockNotifier::default()),
+                Arc::new(crate::port::policy::DefaultPunchPolicy),
+            );
 
-        let use_case = super::PunchUseCase::new(
-            employee_repo,
-            card_repo,
-            punch_repo,
-            audit_repo,
-            notifier,
-            punch_policy,
-        );
+            let resolved = use_case
+                .resolve_card_scan(&card_id, &tokyo_datetime(2026, 4, 16, 9, 0))
+                .await
+                .expect("should resolve");
 
-        let now = tokyo_datetime(2026, 4, 16, 9, 0);
-        let resolved = use_case
-            .resolve_card_scan(&card_id, &now)
-            .await
-            .expect("should resolve");
-
-        assert!(matches!(
-            resolved,
-            super::ResolvedCardScan::Unregistered { .. }
-        ));
+            assert!(matches!(
+                resolved,
+                super::ResolvedCardScan::Unregistered { .. }
+            ));
+        }
     }
 
     struct MockEmployeeRepo {
