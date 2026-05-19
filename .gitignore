@@ -3,5 +3,9 @@
 /web/admin/node_modules
 /web/terminal/node_modules
 /dist
-/.DS_Store
+.DS_Store
 /.pnpm-store
+*.db
+*.db-shm
+*.db-wal
+package-lock.json

@@ -1,5 +1,6 @@
 use jiff::Zoned;
 use jiff::civil::Date;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineworksCommand {
@@ -31,6 +32,31 @@ pub enum CorrectionTarget {
 pub struct ClockTime {
     hour: u8,
     minute: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessEventOutcome {
+    NoAction,
+    HelpSent,
+    TodayAttendanceSent,
+    MonthAttendanceSent,
+    TodayShiftSent,
+    MonthShiftSent,
+    UnregisteredUser,
+    RequestCreated {
+        request_id: Uuid,
+    },
+    AutoApproved {
+        request_id: Uuid,
+        punch_id: Uuid,
+        request_type: AttendanceRequestType,
+    },
+}
+
+impl ProcessEventOutcome {
+    pub fn is_auto_approved(&self) -> bool {
+        matches!(self, Self::AutoApproved { .. })
+    }
 }
 
 impl ClockTime {
@@ -80,21 +106,28 @@ pub fn parse_lineworks_command(input: &str) -> LineworksCommand {
     }
 }
 
+use crate::domain::punch::NewPunchEvent;
 use crate::domain::request::{
     AttendanceRequestSource, AttendanceRequestStatus, AttendanceRequestType, NewAttendanceRequest,
 };
-use crate::domain::time::YearMonth;
+use crate::domain::time::{CutoffDay, CutoffRule, YearMonth};
 use crate::port::notify::{Notifier, NotifyEvent};
+use crate::port::policy::{NoRounding, PunchEventType};
 use crate::port::repo::{
-    AttendanceRequestRepository, ExternalAccountRepository, PunchRepository, ShiftRepository,
+    AttendanceRequestRepository, CardRepository, ExternalAccountRepository, PunchRepository,
+    ShiftRepository,
 };
 use std::sync::Arc;
+
+const MVP_PERIOD_LOCKED: bool = false;
+const MVP_MINOR_CORRECTION_THRESHOLD_MINUTES: i64 = 120;
 
 pub struct LineworksUseCase {
     external_repo: Arc<dyn ExternalAccountRepository>,
     request_repo: Arc<dyn AttendanceRequestRepository>,
     punch_repo: Arc<dyn PunchRepository>,
     shift_repo: Arc<dyn ShiftRepository>,
+    card_repo: Arc<dyn CardRepository>,
     notifier: Arc<dyn Notifier>,
 }
 
@@ -104,6 +137,7 @@ impl LineworksUseCase {
         request_repo: Arc<dyn AttendanceRequestRepository>,
         punch_repo: Arc<dyn PunchRepository>,
         shift_repo: Arc<dyn ShiftRepository>,
+        card_repo: Arc<dyn CardRepository>,
         notifier: Arc<dyn Notifier>,
     ) -> Self {
         Self {
@@ -111,6 +145,7 @@ impl LineworksUseCase {
             request_repo,
             punch_repo,
             shift_repo,
+            card_repo,
             notifier,
         }
     }
@@ -120,7 +155,7 @@ impl LineworksUseCase {
         external_user_id: &str,
         command: LineworksCommand,
         requested_at: &Zoned,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<ProcessEventOutcome> {
         let external_account = self
             .external_repo
             .find_by_external_id("lineworks", external_user_id)
@@ -135,7 +170,7 @@ impl LineworksUseCase {
                         .to_string(),
                 })
                 .await?;
-            return Ok(());
+            return Ok(ProcessEventOutcome::UnregisteredUser);
         };
 
         match command {
@@ -147,11 +182,15 @@ impl LineworksUseCase {
                             .to_string(),
                     })
                     .await?;
+                Ok(ProcessEventOutcome::HelpSent)
             }
             LineworksCommand::TodayAttendance => {
+                let today = requested_at.date();
+                let from = day_start_in_tokyo(today).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let to = day_end_in_tokyo(today).map_err(|e| anyhow::anyhow!("{e}"))?;
                 let punches: Vec<crate::domain::punch::PunchEvent> = self
                     .punch_repo
-                    .list_in_range(account.employee_id, requested_at, requested_at)
+                    .list_in_range(account.employee_id, &from, &to)
                     .await?;
 
                 let message = if punches.is_empty() {
@@ -174,6 +213,46 @@ impl LineworksUseCase {
                         text: message,
                     })
                     .await?;
+                Ok(ProcessEventOutcome::TodayAttendanceSent)
+            }
+            LineworksCommand::MonthAttendance => {
+                let today = requested_at.date();
+                let year_month = YearMonth::new(today.year(), today.month())
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let cutoff_rule =
+                    CutoffRule::DayOfMonth(CutoffDay::new(15).map_err(|e| anyhow::anyhow!("{e}"))?);
+                let period = year_month
+                    .attendance_period(cutoff_rule)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let from =
+                    day_start_in_tokyo(period.period_start).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let to = day_end_in_tokyo(period.period_end).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let punches = self
+                    .punch_repo
+                    .list_in_range(account.employee_id, &from, &to)
+                    .await?;
+
+                let timesheet = build_lineworks_monthly_timesheet(
+                    account.employee_id,
+                    year_month,
+                    cutoff_rule,
+                    punches,
+                )?;
+
+                let message = format!(
+                    "【今月の勤怠】\n期間: {} - {}\n勤務時間合計: {}",
+                    timesheet.period_start,
+                    timesheet.period_end,
+                    format_work_minutes(timesheet.total_work_minutes),
+                );
+
+                self.notifier
+                    .notify(NotifyEvent::LineworksResponse {
+                        user_id: external_user_id.to_string(),
+                        text: message,
+                    })
+                    .await?;
+                Ok(ProcessEventOutcome::MonthAttendanceSent)
             }
             LineworksCommand::MissingIn { time } | LineworksCommand::MissingOut { time } => {
                 let request_type = if matches!(command, LineworksCommand::MissingIn { .. }) {
@@ -185,8 +264,8 @@ impl LineworksUseCase {
                 let status = decide_lineworks_request_status(
                     &command,
                     requested_at,
-                    false, // TODO: check period lock
-                    120,   // TODO: settings
+                    MVP_PERIOD_LOCKED,
+                    MVP_MINOR_CORRECTION_THRESHOLD_MINUTES,
                     None,
                 )
                 .unwrap_or(AttendanceRequestStatus::Requested);
@@ -196,15 +275,53 @@ impl LineworksUseCase {
                     "time": format!("{:02}:{:02}", time.hour(), time.minute()),
                 });
 
-                self.request_repo
+                let request = self
+                    .request_repo
                     .create(NewAttendanceRequest {
                         employee_id: account.employee_id,
                         request_type,
                         requested_payload_json: payload.to_string(),
+                        status,
                         requested_via: AttendanceRequestSource::LineWorks,
                         requested_at: requested_at.clone(),
                     })
                     .await?;
+
+                let mut punch_id: Option<Uuid> = None;
+
+                if status == AttendanceRequestStatus::AutoApproved {
+                    let event_type = match request_type {
+                        AttendanceRequestType::MissingIn => PunchEventType::ClockIn,
+                        AttendanceRequestType::MissingOut => PunchEventType::ClockOut,
+                        _ => unreachable!(),
+                    };
+                    let occurred_at = build_punch_time(requested_at.date(), time)?;
+                    let card_id = self
+                        .card_repo
+                        .find_by_employee(account.employee_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|c| c.id);
+
+                    let punch = self
+                        .punch_repo
+                        .insert(NewPunchEvent {
+                            id: Uuid::now_v7(),
+                            employee_id: account.employee_id,
+                            card_id,
+                            event_type,
+                            occurred_at: occurred_at.clone(),
+                            source: "lineworks".to_string(),
+                        })
+                        .await?;
+
+                    punch_id = Some(punch.id);
+
+                    self.request_repo
+                        .update_status(request.id, AttendanceRequestStatus::Applied, Some(punch.id))
+                        .await?;
+                }
 
                 let response_text = if status == AttendanceRequestStatus::AutoApproved {
                     "申請を自動承認し、反映しました。".to_string()
@@ -218,6 +335,20 @@ impl LineworksUseCase {
                         text: response_text,
                     })
                     .await?;
+
+                if status == AttendanceRequestStatus::AutoApproved {
+                    Ok(ProcessEventOutcome::AutoApproved {
+                        request_id: request.id,
+                        punch_id: punch_id.ok_or_else(|| {
+                            anyhow::anyhow!("punch_id missing after auto-approval")
+                        })?,
+                        request_type,
+                    })
+                } else {
+                    Ok(ProcessEventOutcome::RequestCreated {
+                        request_id: request.id,
+                    })
+                }
             }
             LineworksCommand::TodayShift => {
                 let today = requested_at.date();
@@ -253,6 +384,7 @@ impl LineworksUseCase {
                         text: message,
                     })
                     .await?;
+                Ok(ProcessEventOutcome::TodayShiftSent)
             }
             LineworksCommand::MonthShift => {
                 let today = requested_at.date();
@@ -289,20 +421,205 @@ impl LineworksUseCase {
                         text: message,
                     })
                     .await?;
+                Ok(ProcessEventOutcome::MonthShiftSent)
             }
-            LineworksCommand::MonthAttendance | LineworksCommand::Correction { .. } => {
-                // TODO: 月次勤怠集計・修正申請の承認フローを実装
+            LineworksCommand::Correction { date, target, time } => {
+                let from = day_start_in_tokyo(date).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let to = day_end_in_tokyo(date).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let punches = self
+                    .punch_repo
+                    .list_in_range(account.employee_id, &from, &to)
+                    .await?;
+                let correction_delta_minutes =
+                    calculate_correction_delta_minutes(&punches, target, time, &from);
+                let status = decide_lineworks_request_status(
+                    &command,
+                    requested_at,
+                    MVP_PERIOD_LOCKED,
+                    MVP_MINOR_CORRECTION_THRESHOLD_MINUTES,
+                    correction_delta_minutes,
+                )
+                .unwrap_or(AttendanceRequestStatus::Requested);
+
+                let payload = serde_json::json!({
+                    "command": format!("{:?}", command),
+                    "date": date.to_string(),
+                    "target": match target {
+                        CorrectionTarget::ClockIn => "clock_in",
+                        CorrectionTarget::ClockOut => "clock_out",
+                    },
+                    "time": format!("{:02}:{:02}", time.hour(), time.minute()),
+                });
+
+                let request = self
+                    .request_repo
+                    .create(NewAttendanceRequest {
+                        employee_id: account.employee_id,
+                        request_type: AttendanceRequestType::Correction,
+                        requested_payload_json: payload.to_string(),
+                        status,
+                        requested_via: AttendanceRequestSource::LineWorks,
+                        requested_at: requested_at.clone(),
+                    })
+                    .await?;
+
+                if status == AttendanceRequestStatus::AutoApproved {
+                    let applied_punch_id = apply_correction_to_punch_repo(
+                        self.punch_repo.as_ref(),
+                        &punches,
+                        target,
+                        time,
+                    )
+                    .await?;
+                    self.request_repo
+                        .update_status(
+                            request.id,
+                            AttendanceRequestStatus::Applied,
+                            Some(applied_punch_id),
+                        )
+                        .await?;
+                }
+
+                let response_text = if status == AttendanceRequestStatus::AutoApproved {
+                    "修正申請を自動承認し、反映しました。".to_string()
+                } else {
+                    "修正申請を受け付けました。管理者の承認をお待ちください。".to_string()
+                };
+
                 self.notifier
                     .notify(NotifyEvent::LineworksResponse {
                         user_id: external_user_id.to_string(),
-                        text: "申し訳ありません。そのコマンドは現在準備中です。".to_string(),
+                        text: response_text,
                     })
                     .await?;
+
+                Ok(ProcessEventOutcome::RequestCreated {
+                    request_id: request.id,
+                })
             }
         }
-
-        Ok(())
     }
+}
+
+fn build_lineworks_monthly_timesheet(
+    employee_id: uuid::Uuid,
+    year_month: YearMonth,
+    cutoff_rule: CutoffRule,
+    punches: Vec<crate::domain::punch::PunchEvent>,
+) -> anyhow::Result<crate::domain::time::MonthlyTimesheet> {
+    let mut grouped: std::collections::BTreeMap<Date, Vec<crate::domain::punch::PunchEvent>> =
+        std::collections::BTreeMap::new();
+
+    for punch in punches {
+        grouped
+            .entry(punch.occurred_at.date())
+            .or_default()
+            .push(punch);
+    }
+
+    let days = grouped
+        .into_iter()
+        .map(|(date, events)| {
+            super::attendance::build_attendance_day(
+                date,
+                events,
+                crate::domain::punch::AttendanceDayStatus::Confirmed,
+                &NoRounding,
+            )
+        })
+        .collect();
+
+    super::attendance::build_monthly_timesheet(employee_id, year_month, cutoff_rule, days)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn day_start_in_tokyo(date: Date) -> Result<Zoned, jiff::Error> {
+    format!("{date}T00:00:00+09:00[Asia/Tokyo]").parse()
+}
+
+fn day_end_in_tokyo(date: Date) -> Result<Zoned, jiff::Error> {
+    format!("{date}T23:59:59+09:00[Asia/Tokyo]").parse()
+}
+
+fn format_work_minutes(total_minutes: i64) -> String {
+    let hours = total_minutes / 60;
+    let minutes = total_minutes % 60;
+    format!("{hours}時間{minutes}分")
+}
+
+async fn apply_correction_to_punch_repo(
+    punch_repo: &dyn PunchRepository,
+    punches: &[crate::domain::punch::PunchEvent],
+    target: CorrectionTarget,
+    time: ClockTime,
+) -> anyhow::Result<uuid::Uuid> {
+    let target_event_type = match target {
+        CorrectionTarget::ClockIn => crate::port::policy::PunchEventType::ClockIn,
+        CorrectionTarget::ClockOut => crate::port::policy::PunchEventType::ClockOut,
+    };
+
+    let existing = punches
+        .iter()
+        .find(|punch| punch.event_type == target_event_type)
+        .ok_or_else(|| anyhow::anyhow!("target punch not found for correction"))?;
+    let corrected_at = build_corrected_time(&existing.occurred_at, time)?;
+    let updated = punch_repo
+        .update(
+            existing.id,
+            crate::domain::punch::PunchPatch {
+                event_type: Some(target_event_type),
+                occurred_at: Some(corrected_at),
+            },
+            "lineworks correction".to_string(),
+        )
+        .await?;
+
+    Ok(updated.id)
+}
+
+fn build_corrected_time(base: &Zoned, time: ClockTime) -> anyhow::Result<Zoned> {
+    base.date()
+        .at(
+            i8::try_from(time.hour()).map_err(|e| anyhow::anyhow!("{e}"))?,
+            i8::try_from(time.minute()).map_err(|e| anyhow::anyhow!("{e}"))?,
+            0,
+            0,
+        )
+        .in_tz("Asia/Tokyo")
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn build_punch_time(date: Date, time: ClockTime) -> anyhow::Result<Zoned> {
+    date.at(
+        i8::try_from(time.hour()).map_err(|e| anyhow::anyhow!("{e}"))?,
+        i8::try_from(time.minute()).map_err(|e| anyhow::anyhow!("{e}"))?,
+        0,
+        0,
+    )
+    .in_tz("Asia/Tokyo")
+    .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn calculate_correction_delta_minutes(
+    punches: &[crate::domain::punch::PunchEvent],
+    target: CorrectionTarget,
+    time: ClockTime,
+    fallback_day_start: &Zoned,
+) -> Option<i64> {
+    let target_event_type = match target {
+        CorrectionTarget::ClockIn => crate::port::policy::PunchEventType::ClockIn,
+        CorrectionTarget::ClockOut => crate::port::policy::PunchEventType::ClockOut,
+    };
+
+    let requested_minutes = i64::from(time.hour()) * 60 + i64::from(time.minute());
+    let reference = punches
+        .iter()
+        .find(|punch| punch.event_type == target_event_type)
+        .map(|punch| punch.occurred_at.clone())
+        .unwrap_or_else(|| fallback_day_start.clone());
+    let reference_minutes = i64::from(reference.hour()) * 60 + i64::from(reference.minute());
+
+    Some((requested_minutes - reference_minutes).abs())
 }
 
 pub fn decide_lineworks_request_status(
@@ -377,354 +694,4 @@ fn parse_target(input: &str) -> Option<CorrectionTarget> {
 }
 
 #[cfg(test)]
-mod tests {
-    use jiff::Zoned;
-    use jiff::civil::date;
-    use proptest::prelude::*;
-
-    use super::{CorrectionTarget, LineworksCommand, parse_lineworks_command};
-    use crate::domain::request::AttendanceRequestStatus;
-
-    #[test]
-    // 勤怠照会コマンドは当日勤怠の照会として解釈する。
-    fn parses_today_attendance() {
-        assert_eq!(
-            parse_lineworks_command("今日の勤怠"),
-            LineworksCommand::TodayAttendance
-        );
-    }
-
-    #[test]
-    // 月次シフト照会コマンドは月次シフトの照会として解釈する。
-    fn parses_month_shift() {
-        assert_eq!(
-            parse_lineworks_command("今月のシフト"),
-            LineworksCommand::MonthShift
-        );
-    }
-
-    #[test]
-    // 出勤忘れコマンドは時刻を含めて解釈する。
-    fn parses_missing_in_request() {
-        assert_eq!(
-            parse_lineworks_command("出勤忘れ 08:30"),
-            LineworksCommand::MissingIn {
-                time: super::ClockTime::new(8, 30).expect("valid time"),
-            }
-        );
-    }
-
-    #[test]
-    // 修正コマンドは日付・対象・時刻をすべて解釈する。
-    fn parses_correction_request() {
-        assert_eq!(
-            parse_lineworks_command("修正 2026-04-16 出勤 08:32"),
-            LineworksCommand::Correction {
-                date: date(2026, 4, 16),
-                target: CorrectionTarget::ClockIn,
-                time: super::ClockTime::new(8, 32).expect("valid time"),
-            }
-        );
-    }
-
-    #[test]
-    // 不明コマンドはヘルプ誘導に落とす。
-    fn falls_back_to_help_for_unknown_command() {
-        assert_eq!(
-            parse_lineworks_command("こんにちは"),
-            LineworksCommand::Help
-        );
-    }
-
-    #[test]
-    // 照会コマンドは自動承認扱いになる。
-    fn auto_approves_query_commands() {
-        let requested_at = tokyo_datetime(2026, 4, 16, 10, 0);
-
-        let status = super::decide_lineworks_request_status(
-            &LineworksCommand::TodayAttendance,
-            &requested_at,
-            false,
-            120,
-            None,
-        );
-
-        assert_eq!(status, Some(AttendanceRequestStatus::AutoApproved));
-    }
-
-    #[test]
-    // ヘルプ誘導は申請状態を返さない。
-    fn returns_none_for_help() {
-        let requested_at = tokyo_datetime(2026, 4, 16, 10, 0);
-
-        let status = super::decide_lineworks_request_status(
-            &LineworksCommand::Help,
-            &requested_at,
-            false,
-            120,
-            None,
-        );
-
-        assert_eq!(status, None);
-    }
-
-    proptest! {
-        #[test]
-        // 任意の入力でもパーサは panic せず、未知入力はヘルプ扱いに落ちる。
-        fn never_panics_for_arbitrary_input(input in ".*") {
-            let parsed = parse_lineworks_command(&input);
-            let is_supported = matches!(
-                parsed,
-                LineworksCommand::TodayAttendance
-                    | LineworksCommand::MonthAttendance
-                    | LineworksCommand::TodayShift
-                    | LineworksCommand::MonthShift
-                    | LineworksCommand::MissingIn { .. }
-                    | LineworksCommand::MissingOut { .. }
-                    | LineworksCommand::Correction { .. }
-                    | LineworksCommand::Help
-            );
-
-            prop_assert!(is_supported);
-        }
-    }
-
-    #[tokio::test]
-    // 紐付けられていないユーザーからのコマンドには、登録を促す返信をする。
-    async fn responds_with_unbound_message_when_user_not_found() {
-        let external_repo = Arc::new(MockExternalRepo { account: None });
-        let request_repo = Arc::new(MockRequestRepo);
-        let punch_repo = Arc::new(MockPunchRepo);
-        let shift_repo = Arc::new(MockShiftRepo);
-        let notifier = Arc::new(MockNotifier::default());
-
-        let use_case = super::LineworksUseCase::new(
-            external_repo,
-            request_repo,
-            punch_repo,
-            shift_repo,
-            notifier.clone(),
-        );
-
-        let requested_at = tokyo_datetime(2026, 4, 16, 10, 0);
-        use_case
-            .process_event(
-                "unknown-user",
-                super::LineworksCommand::TodayAttendance,
-                &requested_at,
-            )
-            .await
-            .expect("should process");
-
-        let events = notifier.events.lock().await;
-        assert_eq!(events.len(), 1);
-        if let crate::port::notify::NotifyEvent::LineworksResponse { user_id, text } = &events[0] {
-            assert_eq!(user_id, "unknown-user");
-            assert!(text.contains("紐付いていません"));
-        } else {
-            panic!("unexpected notify event");
-        }
-    }
-
-    #[tokio::test]
-    // 今日の勤怠コマンドには、当日の打刻一覧を返信する。
-    async fn responds_with_today_punches() {
-        let employee_id = uuid::Uuid::now_v7();
-        let external_repo = Arc::new(MockExternalRepo {
-            account: Some(crate::domain::employee::ExternalAccount {
-                id: uuid::Uuid::now_v7(),
-                employee_id,
-                provider: "lineworks".to_string(),
-                external_user_id: "user-1".to_string(),
-                external_domain_id: None,
-                is_verified: true,
-                created_at: tokyo_datetime(2026, 4, 16, 0, 0),
-                updated_at: tokyo_datetime(2026, 4, 16, 0, 0),
-            }),
-        });
-        let request_repo = Arc::new(MockRequestRepo);
-        let punch_repo = Arc::new(MockPunchRepo);
-        let shift_repo = Arc::new(MockShiftRepo);
-        let notifier = Arc::new(MockNotifier::default());
-
-        let use_case = super::LineworksUseCase::new(
-            external_repo,
-            request_repo,
-            punch_repo,
-            shift_repo,
-            notifier.clone(),
-        );
-
-        let requested_at = tokyo_datetime(2026, 4, 16, 10, 0);
-        use_case
-            .process_event(
-                "user-1",
-                super::LineworksCommand::TodayAttendance,
-                &requested_at,
-            )
-            .await
-            .expect("should process");
-
-        let events = notifier.events.lock().await;
-        assert_eq!(events.len(), 1);
-        if let crate::port::notify::NotifyEvent::LineworksResponse { user_id, text } = &events[0] {
-            assert_eq!(user_id, "user-1");
-            assert!(text.contains("【本日の打刻】"));
-            assert!(text.contains("出勤: 09:00"));
-        } else {
-            panic!("unexpected notify event");
-        }
-    }
-
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-
-    #[derive(Default)]
-    struct MockNotifier {
-        events: Mutex<Vec<crate::port::notify::NotifyEvent>>,
-    }
-    #[async_trait::async_trait]
-    impl crate::port::notify::Notifier for MockNotifier {
-        async fn notify(
-            &self,
-            event: crate::port::notify::NotifyEvent,
-        ) -> Result<(), crate::port::notify::NotifyError> {
-            self.events.lock().await.push(event);
-            Ok(())
-        }
-    }
-
-    struct MockExternalRepo {
-        account: Option<crate::domain::employee::ExternalAccount>,
-    }
-    #[async_trait::async_trait]
-    impl crate::port::repo::ExternalAccountRepository for MockExternalRepo {
-        async fn find_by_external_id(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> Result<Option<crate::domain::employee::ExternalAccount>, crate::port::repo::RepoError>
-        {
-            Ok(self.account.clone())
-        }
-        async fn bind(
-            &self,
-            _: uuid::Uuid,
-            _: &str,
-            _: &str,
-        ) -> Result<crate::domain::employee::ExternalAccount, crate::port::repo::RepoError>
-        {
-            unimplemented!()
-        }
-    }
-
-    struct MockRequestRepo;
-    #[async_trait::async_trait]
-    impl crate::port::repo::AttendanceRequestRepository for MockRequestRepo {
-        async fn create(
-            &self,
-            _: crate::domain::request::NewAttendanceRequest,
-        ) -> Result<crate::domain::request::AttendanceRequest, crate::port::repo::RepoError>
-        {
-            Ok(crate::domain::request::AttendanceRequest {
-                id: uuid::Uuid::now_v7(),
-                employee_id: uuid::Uuid::now_v7(),
-                request_type: crate::domain::request::AttendanceRequestType::MissingIn,
-                requested_payload_json: "{}".to_string(),
-                status: crate::domain::request::AttendanceRequestStatus::Requested,
-                requested_via: crate::domain::request::AttendanceRequestSource::LineWorks,
-                requested_at: jiff::Timestamp::now()
-                    .to_zoned(jiff::tz::TimeZone::get("Asia/Tokyo").unwrap()),
-                reviewed_by_admin_user_id: None,
-                reviewed_at: None,
-                review_note: None,
-                applied_event_id: None,
-            })
-        }
-        async fn find(
-            &self,
-            _: uuid::Uuid,
-        ) -> Result<Option<crate::domain::request::AttendanceRequest>, crate::port::repo::RepoError>
-        {
-            unimplemented!()
-        }
-    }
-
-    struct MockPunchRepo;
-    #[async_trait::async_trait]
-    impl crate::port::repo::PunchRepository for MockPunchRepo {
-        async fn insert(
-            &self,
-            _: crate::domain::punch::NewPunchEvent,
-        ) -> Result<crate::domain::punch::PunchEvent, crate::port::repo::RepoError> {
-            unimplemented!()
-        }
-        async fn recent_for_employee(
-            &self,
-            _: uuid::Uuid,
-            _: usize,
-        ) -> Result<Vec<crate::domain::punch::PunchEvent>, crate::port::repo::RepoError> {
-            unimplemented!()
-        }
-        async fn list_in_range(
-            &self,
-            _: uuid::Uuid,
-            _: &Zoned,
-            _: &Zoned,
-        ) -> Result<Vec<crate::domain::punch::PunchEvent>, crate::port::repo::RepoError> {
-            Ok(vec![crate::domain::punch::PunchEvent {
-                id: uuid::Uuid::now_v7(),
-                employee_id: uuid::Uuid::now_v7(),
-                card_id: None,
-                event_type: crate::port::policy::PunchEventType::ClockIn,
-                occurred_at: tokyo_datetime(2026, 4, 16, 9, 0),
-                server_recorded_at: tokyo_datetime(2026, 4, 16, 9, 1),
-                source: "nfc".to_string(),
-                correction_reason: None,
-                deleted_at: None,
-                created_at: tokyo_datetime(2026, 4, 16, 9, 1),
-                updated_at: tokyo_datetime(2026, 4, 16, 9, 1),
-            }])
-        }
-        async fn update(
-            &self,
-            _: uuid::Uuid,
-            _: crate::domain::punch::PunchPatch,
-            _: String,
-        ) -> Result<crate::domain::punch::PunchEvent, crate::port::repo::RepoError> {
-            unimplemented!()
-        }
-        async fn soft_delete(
-            &self,
-            _: uuid::Uuid,
-            _: String,
-        ) -> Result<(), crate::port::repo::RepoError> {
-            unimplemented!()
-        }
-    }
-
-    struct MockShiftRepo;
-    #[async_trait::async_trait]
-    impl crate::port::repo::ShiftRepository for MockShiftRepo {
-        async fn list_for_month(
-            &self,
-            _: uuid::Uuid,
-            _: crate::domain::time::YearMonth,
-        ) -> Result<Vec<crate::domain::shift::ShiftAssignment>, crate::port::repo::RepoError>
-        {
-            unimplemented!()
-        }
-        async fn list_types(
-            &self,
-        ) -> Result<Vec<crate::domain::shift::ShiftType>, crate::port::repo::RepoError> {
-            unimplemented!()
-        }
-    }
-
-    fn tokyo_datetime(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> Zoned {
-        date(year, month, day)
-            .at(hour, minute, 0, 0)
-            .in_tz("Asia/Tokyo")
-            .expect("Asia/Tokyo datetime should be valid")
-    }
-}
+mod tests;

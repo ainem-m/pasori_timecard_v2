@@ -6,7 +6,7 @@ use crate::domain::audit::{AuditLog, AuditLogFilter, NewAuditLog};
 use crate::domain::card::Card;
 use crate::domain::employee::{Employee, EmployeePatch, ExternalAccount, NewEmployee};
 use crate::domain::punch::{NewPunchEvent, PunchEvent, PunchPatch};
-use crate::domain::request::{AttendanceRequest, NewAttendanceRequest};
+use crate::domain::request::{AttendanceRequest, AttendanceRequestStatus, NewAttendanceRequest};
 use crate::domain::shift::{ShiftAssignment, ShiftType};
 use crate::domain::time::YearMonth;
 use crate::port::reader::CardId;
@@ -24,6 +24,7 @@ pub trait EmployeeRepository: Send + Sync {
 #[async_trait]
 pub trait CardRepository: Send + Sync {
     async fn find(&self, card_id: &CardId) -> Result<Option<Card>, RepoError>;
+    async fn find_by_employee(&self, employee_id: Uuid) -> Result<Option<Card>, RepoError>;
     async fn bind(&self, card_id: &CardId, employee_id: Uuid) -> Result<Card, RepoError>;
     async fn unbind(&self, card_id: &CardId) -> Result<(), RepoError>;
 }
@@ -74,6 +75,11 @@ pub trait ExternalAccountRepository: Send + Sync {
         provider: &str,
         external_user_id: &str,
     ) -> Result<Option<ExternalAccount>, RepoError>;
+    async fn find_by_employee_id(
+        &self,
+        provider: &str,
+        employee_id: Uuid,
+    ) -> Result<Option<ExternalAccount>, RepoError>;
     async fn bind(
         &self,
         employee_id: Uuid,
@@ -86,6 +92,12 @@ pub trait ExternalAccountRepository: Send + Sync {
 pub trait AttendanceRequestRepository: Send + Sync {
     async fn create(&self, input: NewAttendanceRequest) -> Result<AttendanceRequest, RepoError>;
     async fn find(&self, id: Uuid) -> Result<Option<AttendanceRequest>, RepoError>;
+    async fn update_status(
+        &self,
+        id: Uuid,
+        status: AttendanceRequestStatus,
+        applied_event_id: Option<Uuid>,
+    ) -> Result<AttendanceRequest, RepoError>;
 }
 
 #[derive(Debug, thiserror::Error)]

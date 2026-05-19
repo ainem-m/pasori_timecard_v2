@@ -49,12 +49,33 @@ impl PunchUseCase {
 
         let Some(card) = card else {
             // 未登録カード
-            self.notifier
+            let _ = self
+                .audit_repo
+                .append(NewAuditLog {
+                    actor_type: "terminal".to_string(),
+                    actor_id: None,
+                    action: "unregistered_card_detected".to_string(),
+                    target_type: "card".to_string(),
+                    target_id: None,
+                    before_json: None,
+                    after_json: None,
+                    metadata_json: Some(
+                        serde_json::json!({
+                            "card_id": card_id.0,
+                            "detected_at": now.to_string(),
+                        })
+                        .to_string(),
+                    ),
+                })
+                .await;
+
+            let _ = self
+                .notifier
                 .notify(NotifyEvent::UnregisteredCardDetected {
                     card_id: card_id.clone(),
                     at: now.clone(),
                 })
-                .await?;
+                .await;
 
             return Ok(ResolvedCardScan::Unregistered {
                 card_id: card_id.clone(),
@@ -82,6 +103,7 @@ impl PunchUseCase {
             employee,
             recent_events,
             suggested_type,
+            card_id: Some(card.id),
         })))
     }
 
@@ -123,6 +145,7 @@ pub struct RegisteredCardScan {
     pub employee: Employee,
     pub recent_events: Vec<PunchEvent>,
     pub suggested_type: PunchEventType,
+    pub card_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,7 +245,7 @@ pub fn decide_attendance_request_status(
             {
                 AttendanceRequestStatus::AutoApproved
             } else {
-                AttendanceRequestStatus::Approved
+                AttendanceRequestStatus::Requested
             }
         }
     }
@@ -428,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    // 当日中でも軽微修正の閾値を超える場合は管理者承認に回す。
+    // 当日中でも軽微修正の閾値を超える場合は承認待ちで保留する。
     fn sends_large_same_day_correction_to_manual_review() {
         let requested_at = tokyo_datetime(2026, 4, 16, 10, 0);
 
@@ -441,7 +464,7 @@ mod tests {
             Some(181),
         );
 
-        assert_eq!(status, AttendanceRequestStatus::Approved);
+        assert_eq!(status, AttendanceRequestStatus::Requested);
     }
 
     #[test]
@@ -693,7 +716,7 @@ mod tests {
             }),
         });
         let punch_repo = Arc::new(MockPunchRepo);
-        let audit_repo = Arc::new(MockAuditRepo);
+        let audit_repo = Arc::new(MockAuditRepo::default());
         let notifier = Arc::new(MockNotifier::default());
         let punch_policy = Arc::new(crate::port::policy::DefaultPunchPolicy);
 
@@ -727,7 +750,7 @@ mod tests {
         let employee_repo = Arc::new(MockEmployeeRepo { employee: None });
         let card_repo = Arc::new(MockCardRepo { card: None });
         let punch_repo = Arc::new(MockPunchRepo);
-        let audit_repo = Arc::new(MockAuditRepo);
+        let audit_repo = Arc::new(MockAuditRepo::default());
         let notifier = Arc::new(MockNotifier::default());
         let punch_policy = Arc::new(crate::port::policy::DefaultPunchPolicy);
 
@@ -735,7 +758,7 @@ mod tests {
             employee_repo,
             card_repo,
             punch_repo,
-            audit_repo,
+            audit_repo.clone(),
             notifier.clone(),
             punch_policy,
         );
@@ -757,6 +780,10 @@ mod tests {
             events[0],
             crate::port::notify::NotifyEvent::UnregisteredCardDetected { .. }
         ));
+
+        let audit_entries = audit_repo.entries.lock().await;
+        assert_eq!(audit_entries.len(), 1);
+        assert_eq!(audit_entries[0].action, "unregistered_card_detected");
     }
 
     struct MockEmployeeRepo {
@@ -797,6 +824,12 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::port::repo::CardRepository for MockCardRepo {
         async fn find(&self, _: &CardId) -> Result<Option<crate::domain::card::Card>, RepoError> {
+            Ok(self.card.clone())
+        }
+        async fn find_by_employee(
+            &self,
+            _: Uuid,
+        ) -> Result<Option<crate::domain::card::Card>, RepoError> {
             Ok(self.card.clone())
         }
         async fn bind(&self, _: &CardId, _: Uuid) -> Result<crate::domain::card::Card, RepoError> {
@@ -853,10 +886,14 @@ mod tests {
         }
     }
 
-    struct MockAuditRepo;
+    #[derive(Default)]
+    struct MockAuditRepo {
+        entries: Mutex<Vec<crate::domain::audit::NewAuditLog>>,
+    }
     #[async_trait::async_trait]
     impl crate::port::repo::AuditLogRepository for MockAuditRepo {
-        async fn append(&self, _: crate::domain::audit::NewAuditLog) -> Result<(), RepoError> {
+        async fn append(&self, entry: crate::domain::audit::NewAuditLog) -> Result<(), RepoError> {
+            self.entries.lock().await.push(entry);
             Ok(())
         }
         async fn list(

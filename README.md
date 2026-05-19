@@ -17,6 +17,8 @@ docs/
 │   ├── 05_audit_and_backup.md # 監査・バックアップ・運用
 │   ├── 06_data_model.md      # データモデル詳細
 │   └── 07_security.md        # 認証・シークレット
+├── verification/             # 実機検証・手動 E2E・受け入れ確認手順
+│   └── README.md
 └── adr/                      # 判断記録 (時系列)
     ├── 0001-tech-stack.md
     ├── 0002-architecture-c-plan.md
@@ -49,3 +51,30 @@ docs/
 - 該当 `docs/spec/*.md` を同一 PR で更新
 - 用語を増やしたら `docs/glossary.md` も更新
 - 変更理由が大きいなら ADR を追加
+
+## Local Helpers
+
+Bitwarden から secret / token を注入して起動する補助スクリプト:
+
+```bash
+scripts/bw-run-server.sh
+scripts/bw-run-terminal.sh
+```
+
+前提:
+
+- `bw` CLI が利用可能
+- 既に `BW_SESSION` を export 済み、または `BW_MASTER_PASSWORD` を設定済み
+- Bitwarden に以下の item 名が存在する
+  - `lineworks-bot-id`
+  - `lineworks-bot-secret`
+  - `lineworks-api-token`
+  - 必要なら `lineworks-admin-channel-id`
+  - `terminal-api-token`
+
+`scripts/bw-run-terminal.sh` は以下を使う:
+
+- `SERVER_API_URL`
+  - 未指定時は `http://localhost:8080/api`
+- `BW_TERMINAL_TOKEN_ITEM`
+  - 未指定時は `terminal-api-token`

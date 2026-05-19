@@ -1,0 +1,20 @@
+# Custom command permissions for the terminal app
+[[permission]]
+identifier = "allow-get-reader-status"
+description = "Allows getting the current NFC reader status"
+commands.allow = ["get_reader_status"]
+
+[[permission]]
+identifier = "allow-resolve-card"
+description = "Allows resolving a card ID to an employee via the server"
+commands.allow = ["resolve_card"]
+
+[[permission]]
+identifier = "allow-submit-punch"
+description = "Allows submitting a punch event (clock-in/out)"
+commands.allow = ["submit_punch"]
+
+[[permission]]
+identifier = "allow-check-clock-sync"
+description = "Allows checking time synchronization with the server"
+commands.allow = ["check_clock_sync"]

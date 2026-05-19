@@ -1,3 +1,4 @@
+use rusb::UsbContext;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -59,8 +60,12 @@ impl Transport for MockTransport {
     }
 }
 
+#[repr(align(64))]
+struct AlignedBuffer([u8; 1024]);
+
 pub struct UsbTransport {
-    handle: rusb::DeviceHandle<rusb::GlobalContext>,
+    handle: rusb::DeviceHandle<rusb::Context>,
+    _context: rusb::Context,
 }
 
 const RC_S380_VID: u16 = 0x054C;
@@ -71,7 +76,11 @@ impl UsbTransport {
     /// nfcpy と同じシーケンス: open → set_configuration(1) → claim → ACK soft-reset
     /// USB reset は行わない（re-enumeration 後にデバイスが invalid state になるため）
     pub fn open() -> Result<Self, TransportError> {
-        let devices = rusb::devices().map_err(|e| TransportError::Usb(format!("{:?}", e)))?;
+        let context = rusb::Context::new()
+            .map_err(|e| TransportError::Usb(format!("context creation failed: {:?}", e)))?;
+        let devices = context
+            .devices()
+            .map_err(|e| TransportError::Usb(format!("{:?}", e)))?;
 
         for device in devices.iter() {
             let desc = match device.device_descriptor() {
@@ -80,34 +89,66 @@ impl UsbTransport {
             };
 
             if desc.vendor_id() == RC_S380_VID && desc.product_id() == RC_S380_PID {
+                tracing::debug!("opening RC-S380 device...");
                 let handle = device
                     .open()
-                    .map_err(|e| TransportError::Usb(format!("{:?}", e)))?;
+                    .map_err(|e| TransportError::Usb(format!("open failed: {:?}", e)))?;
 
-                // macOS では no-op だが Linux では必要な場合がある
-                let _ = handle.detach_kernel_driver(0);
+                // macOS では通常 detach 不要。
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = handle.detach_kernel_driver(0);
+                }
 
-                // nfcpy の set_configuration() 相当: エンドポイント状態をクリアする
-                // 既に config 1 の場合でも SET_CONFIGURATION 制御転送でエンドポイントをリセット
-                // エラーは無視（既に claim 済みの場合は BUSY が返ることがある）
-                let _ = handle.set_active_configuration(1);
+                // 現在の configuration を確認
+                let active_config = device
+                    .active_config_descriptor()
+                    .map(|d: rusb::ConfigDescriptor| d.number())
+                    .unwrap_or(0);
 
+                if active_config != 1 {
+                    tracing::debug!(current = active_config, "setting active configuration to 1");
+                    handle.set_active_configuration(1).map_err(|e| {
+                        TransportError::Usb(format!("set_active_configuration failed: {:?}", e))
+                    })?;
+                } else {
+                    tracing::debug!("device already in configuration 1, skipping reset");
+                }
+
+                tracing::debug!("claiming interface 0");
                 handle
                     .claim_interface(0)
-                    .map_err(|e| TransportError::Usb(format!("{:?}", e)))?;
+                    .map_err(|e| TransportError::Usb(format!("claim_interface failed: {:?}", e)))?;
 
                 // nfcpy 互換のソフトリセット: ACK フレームを送信してデバイスステートをクリア
+                tracing::debug!("sending soft-reset ACK");
                 let ack = [0x00u8, 0x00, 0xFF, 0x00, 0xFF, 0x00];
-                let _ = handle.write_bulk(0x02, &ack, Duration::from_millis(100));
-                std::thread::sleep(Duration::from_millis(10));
-                // ACK への応答をドレイン
-                let mut drain_buf = vec![0u8; 256];
-                while handle
-                    .read_bulk(0x81, &mut drain_buf, Duration::from_millis(50))
-                    .is_ok()
-                {}
+                let mut aligned_ack = AlignedBuffer([0u8; 1024]);
+                aligned_ack.0[..6].copy_from_slice(&ack);
 
-                return Ok(UsbTransport { handle });
+                handle
+                    .write_bulk(0x02, &aligned_ack.0[..6], Duration::from_millis(100))
+                    .map_err(|e| {
+                        TransportError::Usb(format!("soft-reset ACK write failed: {:?}", e))
+                    })?;
+                std::thread::sleep(Duration::from_millis(10));
+
+                // ACK への応答をドレイン
+                let mut aligned_drain = AlignedBuffer([0u8; 1024]);
+                let mut drain_count = 0;
+                tracing::debug!("draining USB packets...");
+                while handle
+                    .read_bulk(0x81, &mut aligned_drain.0, Duration::from_millis(50))
+                    .is_ok()
+                {
+                    drain_count += 1;
+                }
+                tracing::debug!(drain_count, "USB drain complete");
+
+                return Ok(UsbTransport {
+                    handle,
+                    _context: context,
+                });
             }
         }
 
@@ -117,23 +158,47 @@ impl UsbTransport {
 
 impl Transport for UsbTransport {
     fn send(&self, data: &[u8]) -> Result<(), TransportError> {
-        self.handle
-            .write_bulk(0x02, data, Duration::from_millis(1000))
+        let mut aligned = AlignedBuffer([0u8; 1024]);
+        let len = data.len().min(1024);
+        aligned.0[..len].copy_from_slice(&data[..len]);
+
+        tracing::trace!(len, "USB write_bulk start");
+        let res = self
+            .handle
+            .write_bulk(0x02, &aligned.0[..len], Duration::from_millis(1000))
             .map(|_| ())
-            .map_err(|e| TransportError::Usb(format!("{:?}", e)))
+            .map_err(|e| TransportError::Usb(format!("{:?}", e)));
+        tracing::trace!(?res, "USB write_bulk end");
+        res
     }
 
     fn recv(&self, buf: &mut [u8], timeout_ms: u64) -> Result<usize, TransportError> {
-        self.handle
-            .read_bulk(0x81, buf, Duration::from_millis(timeout_ms))
+        let mut aligned = AlignedBuffer([0u8; 1024]);
+        let max_len = buf.len().min(1024);
+
+        tracing::trace!(max_len, timeout_ms, "USB read_bulk start");
+        let res = self
+            .handle
+            .read_bulk(
+                0x81,
+                &mut aligned.0[..max_len],
+                Duration::from_millis(timeout_ms),
+            )
             .map_err(|e| {
-                // rusb::Error::Timeout for timeout errors
                 if let rusb::Error::Timeout = e {
                     TransportError::Timeout
                 } else {
                     TransportError::Usb(format!("{:?}", e))
                 }
-            })
+            });
+
+        if let Ok(n) = res {
+            buf[..n].copy_from_slice(&aligned.0[..n]);
+            tracing::trace!(bytes = n, "USB read_bulk end");
+        } else {
+            tracing::trace!(?res, "USB read_bulk end");
+        }
+        res
     }
 }
 
@@ -194,7 +259,11 @@ mod tests {
         panic!("RC-S380 not found");
     }
 
-    fn raw_exchange(handle: &rusb::DeviceHandle<rusb::GlobalContext>, name: &str, payload: &[u8]) {
+    fn raw_exchange<T: rusb::UsbContext>(
+        handle: &rusb::DeviceHandle<T>,
+        name: &str,
+        payload: &[u8],
+    ) {
         let cmd = super::super::frame::encode(payload);
         println!("\n[{}] 送信: {:02X?}", name, cmd);
         match handle.write_bulk(0x02, &cmd, Duration::from_millis(1000)) {

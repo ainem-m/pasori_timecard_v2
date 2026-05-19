@@ -11,7 +11,9 @@ use jiff::{Timestamp, Zoned, tz::TimeZone};
 use pasori_core::application::lineworks::{
     LineworksCommand, LineworksUseCase, decide_lineworks_request_status, parse_lineworks_command,
 };
+use pasori_core::domain::audit::NewAuditLog;
 use pasori_core::domain::request::AttendanceRequestStatus;
+use pasori_core::port::repo::AuditLogRepository;
 use serde::Deserialize;
 use sha2::Sha256;
 use std::sync::Arc;
@@ -24,21 +26,31 @@ const DEFAULT_MINOR_CORRECTION_THRESHOLD_MINUTES: i64 = 120;
 pub struct LineworksAppState {
     bot_secret: Arc<[u8]>,
     use_case: Arc<LineworksUseCase>,
+    audit_repo: Arc<dyn AuditLogRepository>,
 }
 
 impl LineworksAppState {
-    pub fn new(bot_secret: impl Into<Arc<[u8]>>, use_case: Arc<LineworksUseCase>) -> Self {
+    pub fn new(
+        bot_secret: impl Into<Arc<[u8]>>,
+        use_case: Arc<LineworksUseCase>,
+        audit_repo: Arc<dyn AuditLogRepository>,
+    ) -> Self {
         Self {
             bot_secret: bot_secret.into(),
             use_case,
+            audit_repo,
         }
     }
 }
 
-pub fn router(bot_secret: impl Into<Arc<[u8]>>, use_case: Arc<LineworksUseCase>) -> Router {
+pub fn router(
+    bot_secret: impl Into<Arc<[u8]>>,
+    use_case: Arc<LineworksUseCase>,
+    audit_repo: Arc<dyn AuditLogRepository>,
+) -> Router {
     Router::new()
-        .route("/api/lineworks/callback", post(callback))
-        .with_state(LineworksAppState::new(bot_secret, use_case))
+        .route("/lineworks/callback", post(callback))
+        .with_state(LineworksAppState::new(bot_secret, use_case, audit_repo))
 }
 
 pub fn verify_lineworks_signature(body: &[u8], signature: &str, secret: &[u8]) -> bool {
@@ -129,10 +141,46 @@ async fn callback(
         .get("X-WORKS-Signature")
         .and_then(|value| value.to_str().ok())
     else {
+        if let Err(e) = state
+            .audit_repo
+            .append(NewAuditLog {
+                actor_type: "system".to_string(),
+                actor_id: None,
+                action: "lineworks.signature_missing".to_string(),
+                target_type: "lineworks_callback".to_string(),
+                target_id: None,
+                before_json: None,
+                after_json: None,
+                metadata_json: Some(
+                    serde_json::json!({ "reason": "missing_signature_header" }).to_string(),
+                ),
+            })
+            .await
+        {
+            tracing::error!(error = %e, action = "lineworks.signature_missing", "audit log append failed");
+        }
         return StatusCode::UNAUTHORIZED;
     };
 
     if !verify_lineworks_signature(&body, signature, &state.bot_secret) {
+        if let Err(e) = state
+            .audit_repo
+            .append(NewAuditLog {
+                actor_type: "system".to_string(),
+                actor_id: None,
+                action: "lineworks.signature_invalid".to_string(),
+                target_type: "lineworks_callback".to_string(),
+                target_id: None,
+                before_json: None,
+                after_json: None,
+                metadata_json: Some(
+                    serde_json::json!({ "reason": "signature_mismatch" }).to_string(),
+                ),
+            })
+            .await
+        {
+            tracing::error!(error = %e, action = "lineworks.signature_invalid", "audit log append failed");
+        }
         return StatusCode::UNAUTHORIZED;
     }
 
@@ -155,15 +203,43 @@ async fn callback(
             "processing lineworks callback"
         );
 
-        if let Err(e) = state
+        match state
             .use_case
             .process_event(&event.user_id, event.command, &requested_at)
             .await
         {
-            tracing::error!(error = %e, "failed to process lineworks event");
-            // NOTE: We still return 204 to LINE WORKS as they will retry on error,
-            // but we might want to return 500 in some cases.
-            // For now, follow fire-and-forget for notifications but use_case itself might fail.
+            Ok(pasori_core::application::lineworks::ProcessEventOutcome::AutoApproved {
+                request_id,
+                punch_id,
+                request_type,
+            }) => {
+                if let Err(e) = state
+                    .audit_repo
+                    .append(pasori_core::domain::audit::NewAuditLog {
+                        actor_type: "system".to_string(),
+                        actor_id: None,
+                        action: "request.auto_approved".to_string(),
+                        target_type: "attendance_request".to_string(),
+                        target_id: Some(request_id.to_string()),
+                        before_json: None,
+                        after_json: None,
+                        metadata_json: Some(
+                            serde_json::json!({
+                                "punch_id": punch_id.to_string(),
+                                "request_type": format!("{:?}", request_type),
+                            })
+                            .to_string(),
+                        ),
+                    })
+                    .await
+                {
+                    tracing::error!(error = %e, action = "request.auto_approved", "audit log append failed");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "failed to process lineworks event");
+            }
         }
     }
 
@@ -185,7 +261,8 @@ mod tests {
     use hmac::Mac;
     use jiff::Zoned;
     use pasori_core::application::lineworks::LineworksCommand;
-    use std::sync::Arc;
+    use pasori_core::domain::audit::NewAuditLog;
+    use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
 
     fn mock_use_case() -> Arc<LineworksUseCase> {
@@ -196,6 +273,16 @@ mod tests {
                 &self,
                 _: &str,
                 _: &str,
+            ) -> Result<
+                Option<pasori_core::domain::employee::ExternalAccount>,
+                pasori_core::port::repo::RepoError,
+            > {
+                Ok(None)
+            }
+            async fn find_by_employee_id(
+                &self,
+                _: &str,
+                _: uuid::Uuid,
             ) -> Result<
                 Option<pasori_core::domain::employee::ExternalAccount>,
                 pasori_core::port::repo::RepoError,
@@ -230,6 +317,17 @@ mod tests {
                 _: uuid::Uuid,
             ) -> Result<
                 Option<pasori_core::domain::request::AttendanceRequest>,
+                pasori_core::port::repo::RepoError,
+            > {
+                unimplemented!()
+            }
+            async fn update_status(
+                &self,
+                _: uuid::Uuid,
+                _: pasori_core::domain::request::AttendanceRequestStatus,
+                _: Option<uuid::Uuid>,
+            ) -> Result<
+                pasori_core::domain::request::AttendanceRequest,
                 pasori_core::port::repo::RepoError,
             > {
                 unimplemented!()
@@ -304,6 +402,37 @@ mod tests {
             }
         }
         #[async_trait::async_trait]
+        impl pasori_core::port::repo::CardRepository for Mock {
+            async fn find(
+                &self,
+                _: &pasori_core::port::reader::CardId,
+            ) -> Result<Option<pasori_core::domain::card::Card>, pasori_core::port::repo::RepoError>
+            {
+                unimplemented!()
+            }
+            async fn find_by_employee(
+                &self,
+                _: uuid::Uuid,
+            ) -> Result<Option<pasori_core::domain::card::Card>, pasori_core::port::repo::RepoError>
+            {
+                unimplemented!()
+            }
+            async fn bind(
+                &self,
+                _: &pasori_core::port::reader::CardId,
+                _: uuid::Uuid,
+            ) -> Result<pasori_core::domain::card::Card, pasori_core::port::repo::RepoError>
+            {
+                unimplemented!()
+            }
+            async fn unbind(
+                &self,
+                _: &pasori_core::port::reader::CardId,
+            ) -> Result<(), pasori_core::port::repo::RepoError> {
+                unimplemented!()
+            }
+        }
+        #[async_trait::async_trait]
         impl pasori_core::port::notify::Notifier for Mock {
             async fn notify(
                 &self,
@@ -320,7 +449,62 @@ mod tests {
             m.clone(),
             m.clone(),
             m.clone(),
+            m.clone(),
         ))
+    }
+
+    fn mock_audit_repo() -> Arc<dyn pasori_core::port::repo::AuditLogRepository> {
+        struct AuditMock;
+        #[async_trait::async_trait]
+        impl pasori_core::port::repo::AuditLogRepository for AuditMock {
+            async fn append(
+                &self,
+                _: pasori_core::domain::audit::NewAuditLog,
+            ) -> Result<(), pasori_core::port::repo::RepoError> {
+                Ok(())
+            }
+            async fn list(
+                &self,
+                _: pasori_core::domain::audit::AuditLogFilter,
+            ) -> Result<Vec<pasori_core::domain::audit::AuditLog>, pasori_core::port::repo::RepoError>
+            {
+                Ok(vec![])
+            }
+        }
+        Arc::new(AuditMock)
+    }
+
+    fn recording_audit_repo() -> (
+        Arc<dyn pasori_core::port::repo::AuditLogRepository>,
+        Arc<Mutex<Vec<NewAuditLog>>>,
+    ) {
+        #[derive(Debug)]
+        struct RecordingAuditMock {
+            records: Arc<Mutex<Vec<NewAuditLog>>>,
+        }
+        #[async_trait::async_trait]
+        impl pasori_core::port::repo::AuditLogRepository for RecordingAuditMock {
+            async fn append(
+                &self,
+                entry: pasori_core::domain::audit::NewAuditLog,
+            ) -> Result<(), pasori_core::port::repo::RepoError> {
+                self.records.lock().unwrap().push(entry);
+                Ok(())
+            }
+            async fn list(
+                &self,
+                _: pasori_core::domain::audit::AuditLogFilter,
+            ) -> Result<Vec<pasori_core::domain::audit::AuditLog>, pasori_core::port::repo::RepoError>
+            {
+                Ok(vec![])
+            }
+        }
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let repo: Arc<dyn pasori_core::port::repo::AuditLogRepository> =
+            Arc::new(RecordingAuditMock {
+                records: records.clone(),
+            });
+        (repo, records)
     }
 
     #[tokio::test]
@@ -380,12 +564,12 @@ mod tests {
 
         let request: Request<Body> = Request::builder()
             .method("POST")
-            .uri("/api/lineworks/callback")
+            .uri("/lineworks/callback")
             .header("X-WORKS-Signature", signature)
             .body(Body::from(body))
             .expect("request should be built");
 
-        let response = router(secret.to_vec(), mock_use_case())
+        let response = router(secret.to_vec(), mock_use_case(), mock_audit_repo())
             .oneshot(request)
             .await
             .expect("response should be returned");
@@ -408,11 +592,11 @@ mod tests {
 
         let request: Request<Body> = Request::builder()
             .method("POST")
-            .uri("/api/lineworks/callback")
+            .uri("/lineworks/callback")
             .body(Body::from(body))
             .expect("request should be built");
 
-        let response = router(secret.to_vec(), mock_use_case())
+        let response = router(secret.to_vec(), mock_use_case(), mock_audit_repo())
             .oneshot(request)
             .await
             .expect("response should be returned");
@@ -436,12 +620,12 @@ mod tests {
 
         let request: Request<Body> = Request::builder()
             .method("POST")
-            .uri("/api/lineworks/callback")
+            .uri("/lineworks/callback")
             .header("X-WORKS-Signature", signature)
             .body(Body::from(body))
             .expect("request should be built");
 
-        let response = router(secret.to_vec(), mock_use_case())
+        let response = router(secret.to_vec(), mock_use_case(), mock_audit_repo())
             .oneshot(request)
             .await
             .expect("response should be returned");
@@ -539,17 +723,83 @@ mod tests {
 
         let request: Request<Body> = Request::builder()
             .method("POST")
-            .uri("/api/lineworks/callback")
+            .uri("/lineworks/callback")
             .header("X-WORKS-Signature", signature)
             .body(Body::from(body.as_slice()))
             .expect("request should be built");
 
-        let response = router(secret.to_vec(), mock_use_case())
+        let response = router(secret.to_vec(), mock_use_case(), mock_audit_repo())
             .oneshot(request)
             .await
             .expect("response should be returned");
 
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    // 署名ヘッダーなしの callback は audit log に記録される。
+    async fn audit_logs_missing_signature() {
+        let body = r#"{
+            "events": [
+                {
+                    "source": { "userId": "user-1" },
+                    "content": { "text": "今日の勤怠" }
+                }
+            ]
+        }"#;
+        let secret = b"secret";
+
+        let request: Request<Body> = Request::builder()
+            .method("POST")
+            .uri("/lineworks/callback")
+            .body(Body::from(body))
+            .expect("request should be built");
+
+        let (audit_repo, audit_records) = recording_audit_repo();
+        let response = router(secret.to_vec(), mock_use_case(), audit_repo)
+            .oneshot(request)
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let records = audit_records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].action, "lineworks.signature_missing");
+    }
+
+    #[tokio::test]
+    // 署名不一致の callback は audit log に記録される。
+    async fn audit_logs_invalid_signature() {
+        let body = r#"{
+            "events": [
+                {
+                    "source": { "userId": "user-1" },
+                    "content": { "text": "今日の勤怠" }
+                }
+            ]
+        }"#;
+        let secret = b"secret";
+        let signature = signature_for(body.as_bytes(), b"other-secret");
+
+        let request: Request<Body> = Request::builder()
+            .method("POST")
+            .uri("/lineworks/callback")
+            .header("X-WORKS-Signature", signature)
+            .body(Body::from(body))
+            .expect("request should be built");
+
+        let (audit_repo, audit_records) = recording_audit_repo();
+        let response = router(secret.to_vec(), mock_use_case(), audit_repo)
+            .oneshot(request)
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let records = audit_records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].action, "lineworks.signature_invalid");
     }
 
     fn signature_for(body: &[u8], secret: &[u8]) -> String {

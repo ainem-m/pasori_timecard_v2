@@ -45,24 +45,28 @@ impl<T: Transport> Chipset<T> {
     /// チップセット初期化 (nfcpy Chipset.__init__ + sense_ttf 互換)
     pub fn initialize(&self) -> Result<(), ChipsetError> {
         // Step 1: SetCommandType(1) — Port-100 拡張コマンドモードを有効化
+        tracing::debug!("Step 1: SetCommandType(1)");
         self.send_command_and_recv(&[0xD6, 0x2A, 0x01])?;
 
         // Step 2: GetFirmwareVersion
+        tracing::debug!("Step 2: GetFirmwareVersion");
         let ver = self.get_firmware_version()?;
         tracing::info!(fw = %ver, "RC-S380 firmware version");
 
         // Step 3: GetPDDataVersion (nfcpy Chipset.__init__ で必須)
+        tracing::debug!("Step 3: GetPDDataVersion");
         self.send_command_and_recv(&[0xD6, 0x22])?;
 
         // Step 4: SwitchRF off
+        tracing::debug!("Step 4: SwitchRF off");
         self.send_command_and_recv(&[0xD6, 0x06, 0x00])?;
 
         // Step 5: InSetRF (212F: send_set=1, comm_type=0x01, recv_set=0x0F, recv_comm_type=0x01)
+        tracing::debug!("Step 5: InSetRF");
         self.send_command_and_recv(&[0xD6, 0x00, 0x01, 0x01, 0x0F, 0x01])?;
 
         // Step 6: InSetProtocol (nfcpy in_set_protocol_defaults — tag-value ペア, END マーカーなし)
-        // nfcpy: bytearray.fromhex("0018 0101 0201 0300 0400 0500 0600 0708 0800 0900
-        //                           0A00 0B00 0C00 0E04 0F00 1000 1100 1200 1306")
+        tracing::debug!("Step 6: InSetProtocol");
         #[rustfmt::skip]
         let defaults_payload = [
             0x00u8, 0x18,  // INITIAL_GUARD_TIME = 24 (0x18)
@@ -79,7 +83,6 @@ impl<T: Transport> Chipset<T> {
             0x0B, 0x00,    // ADD_EOF = 0
             0x0C, 0x00,    // CHECK_EOF = 0
             0x0E, 0x04,    // DEAF_TIME = 4
-            0x0F, 0x00,    // CRM = 0
             0x10, 0x00,    // CRM_MIN_LEN = 0
             0x11, 0x00,    // T1_TAG_RRDD = 0
             0x12, 0x00,    // RFCA = 0
@@ -180,13 +183,16 @@ impl<T: Transport> Chipset<T> {
     /// コマンドを送信し、ACK と レスポンスを受信する。
     fn send_command_and_recv(&self, cmd: &[u8]) -> Result<Vec<u8>, ChipsetError> {
         let frame = frame::encode(cmd);
+        tracing::trace!(cmd = ?cmd, "sending USB frame");
         self.transport.send(&frame)?;
 
-        let mut ack_buf = vec![0u8; 256];
+        tracing::trace!("waiting for ACK...");
+        let mut ack_buf = [0u8; 512];
         let ack_size = self.transport.recv(&mut ack_buf, 1000)?;
 
         let is_ack = ack_size == 6 && ack_buf[..6] == [0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00];
         if !is_ack {
+            tracing::debug!(size = ack_size, hex = ?&ack_buf[..ack_size], "received non-ACK instead of ACK");
             // 6バイトACKではなかった場合、これ自体がレスポンスの可能性もある
             let data = ack_buf[..ack_size].to_vec();
             return match frame::decode(&data)? {
@@ -200,12 +206,15 @@ impl<T: Transport> Chipset<T> {
                 }
             };
         }
+        tracing::trace!("ACK received");
 
-        let mut resp_buf = vec![0u8; 256];
+        tracing::trace!("waiting for response data...");
+        let mut resp_buf = [0u8; 512];
         let resp_size = self.transport.recv(&mut resp_buf, 2500)?;
-        resp_buf.truncate(resp_size);
+        let data = resp_buf[..resp_size].to_vec();
+        tracing::trace!(size = resp_size, "response data received");
 
-        match frame::decode(&resp_buf)? {
+        match frame::decode(&data)? {
             DecodedFrame::Data(p) => Ok(p),
             DecodedFrame::Ack => Err(ChipsetError::Protocol(
                 "expected data frame, got ACK".to_string(),
@@ -240,7 +249,9 @@ impl RCS380ReaderBackend {
     }
 
     fn set_status(&self, s: ReaderStatus) {
-        *self.status.lock().expect("status lock") = s;
+        if let Err(error) = set_shared_status(&self.status, s) {
+            tracing::error!(%error, "failed to update RCS380 reader status");
+        }
     }
 }
 
@@ -253,7 +264,10 @@ impl Default for RCS380ReaderBackend {
 #[async_trait::async_trait]
 impl ReaderBackend for RCS380ReaderBackend {
     async fn start(&self) -> Result<(), ReaderError> {
-        let mut handle_guard = self.handle.lock().expect("handle lock");
+        let mut handle_guard = self
+            .handle
+            .lock()
+            .map_err(|_| ReaderError::Other("handle lock poisoned".to_string()))?;
         if handle_guard.is_some() {
             return Ok(());
         }
@@ -261,7 +275,10 @@ impl ReaderBackend for RCS380ReaderBackend {
         self.set_status(ReaderStatus::Connecting);
 
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        *self.cancel.lock().expect("cancel lock") = Some(cancel_tx);
+        *self
+            .cancel
+            .lock()
+            .map_err(|_| ReaderError::Other("cancel lock poisoned".to_string()))? = Some(cancel_tx);
 
         let tx = self.tx.clone();
         let status = self.status.clone();
@@ -275,10 +292,19 @@ impl ReaderBackend for RCS380ReaderBackend {
     }
 
     async fn stop(&self) -> Result<(), ReaderError> {
-        if let Some(tx) = self.cancel.lock().expect("cancel lock").take() {
+        if let Some(tx) = self
+            .cancel
+            .lock()
+            .map_err(|_| ReaderError::Other("cancel lock poisoned".to_string()))?
+            .take()
+        {
             let _ = tx.send(true);
         }
-        let handle = self.handle.lock().expect("handle lock").take();
+        let handle = self
+            .handle
+            .lock()
+            .map_err(|_| ReaderError::Other("handle lock poisoned".to_string()))?
+            .take();
         if let Some(h) = handle {
             let _ = h.await;
         }
@@ -287,7 +313,7 @@ impl ReaderBackend for RCS380ReaderBackend {
     }
 
     fn status(&self) -> ReaderStatus {
-        self.status.lock().expect("status lock").clone()
+        shared_status_snapshot(&self.status)
     }
 
     fn subscribe(&self) -> broadcast::Receiver<CardScanned> {
@@ -303,8 +329,7 @@ fn poll_loop(
     let transport = match super::transport::UsbTransport::open() {
         Ok(t) => t,
         Err(e) => {
-            *status.lock().expect("status lock") =
-                ReaderStatus::Error(format!("USB open error: {e}"));
+            let _ = set_shared_status(&status, ReaderStatus::Error(format!("USB open error: {e}")));
             return;
         }
     };
@@ -312,12 +337,14 @@ fn poll_loop(
     let chipset = Chipset::new(transport);
 
     if let Err(e) = chipset.initialize() {
-        *status.lock().expect("status lock") =
-            ReaderStatus::Error(format!("initialize error: {e}"));
+        let _ = set_shared_status(
+            &status,
+            ReaderStatus::Error(format!("initialize error: {e}")),
+        );
         return;
     }
 
-    *status.lock().expect("status lock") = ReaderStatus::Ready;
+    let _ = set_shared_status(&status, ReaderStatus::Ready);
 
     let mut last_seen: HashMap<String, std::time::Instant> = HashMap::new();
     let mut poll_counter: u32 = 0;
@@ -352,7 +379,15 @@ fn poll_loop(
 
                 if !suppress {
                     last_seen.insert(idm_hex.clone(), now_instant);
-                    let scanned_at = tokyo_now();
+                    let scanned_at = match tokyo_now() {
+                        Ok(scanned_at) => scanned_at,
+                        Err(error) => {
+                            let _ =
+                                set_shared_status(&status, ReaderStatus::Error(error.to_string()));
+                            tracing::error!(%error, "failed to get Tokyo time for card scan");
+                            return;
+                        }
+                    };
                     tracing::info!(card_id = %idm_hex, "card scanned");
                     let _ = tx.send(CardScanned {
                         card_id: CardId(idm_hex),
@@ -370,14 +405,38 @@ fn poll_loop(
     let _ = chipset.shutdown();
 }
 
-fn tokyo_now() -> jiff::Zoned {
-    jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::get("Asia/Tokyo").expect("Asia/Tokyo tz"))
+fn tokyo_now() -> Result<jiff::Zoned, ReaderError> {
+    let timezone = jiff::tz::TimeZone::get("Asia/Tokyo")
+        .map_err(|error| ReaderError::Other(format!("Asia/Tokyo timezone unavailable: {error}")))?;
+    Ok(jiff::Timestamp::now().to_zoned(timezone))
+}
+
+fn set_shared_status(status: &Mutex<ReaderStatus>, next: ReaderStatus) -> Result<(), ReaderError> {
+    let mut guard = status
+        .lock()
+        .map_err(|_| ReaderError::Other("status lock poisoned".to_string()))?;
+    *guard = next;
+    Ok(())
+}
+
+fn shared_status_snapshot(status: &Mutex<ReaderStatus>) -> ReaderStatus {
+    match status.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => ReaderStatus::Error("status lock poisoned".to_string()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rcs380::transport::MockTransport;
+
+    fn poison_mutex<T>(mutex: &Mutex<T>) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mutex.lock().expect("test mutex lock should succeed");
+            panic!("poison mutex for test");
+        }));
+    }
 
     #[test]
     // 初期状態は Disconnected である。
@@ -391,6 +450,20 @@ mod tests {
     fn subscribe_returns_receiver() {
         let reader = RCS380ReaderBackend::new();
         let _rx = reader.subscribe();
+    }
+
+    #[test]
+    // status mutex が poison されても panic せず Error を返す。
+    fn status_returns_error_when_status_mutex_is_poisoned() {
+        let reader = RCS380ReaderBackend::new();
+        poison_mutex(&reader.status);
+
+        let status = reader.status();
+
+        assert_eq!(
+            status,
+            ReaderStatus::Error("status lock poisoned".to_string())
+        );
     }
 
     fn queue_command_response(transport: &MockTransport, response_payload: &[u8]) {
