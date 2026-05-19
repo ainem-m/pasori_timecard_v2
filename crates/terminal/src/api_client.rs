@@ -1,4 +1,5 @@
 use anyhow::Result;
+use pasori_core::domain::card::Card;
 use pasori_core::domain::employee::Employee;
 use pasori_core::domain::punch::PunchEvent;
 use pasori_core::port::policy::PunchEventType;
@@ -26,6 +27,24 @@ pub struct SubmitPunchRequest {
     pub event_type: PunchEventType,
     pub occurred_at: jiff::Zoned,
     pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindUnregisteredCardRequest {
+    pub card_id: String,
+    pub employee_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalEmployee {
+    pub id: Uuid,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindUnregisteredCardResponse {
+    pub card: Card,
+    pub employee: TerminalEmployee,
 }
 
 #[derive(Clone)]
@@ -69,6 +88,42 @@ impl ApiClient {
             req = req.bearer_auth(token);
         }
         let resp = req.send().await?;
+
+        Ok(resp.json().await?)
+    }
+
+    pub async fn list_active_employees(&self) -> Result<Vec<TerminalEmployee>> {
+        let mut req = self
+            .client
+            .get(format!("{}/terminals/me/employees", self.base_url));
+        if let Some(token) = &self.api_token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().await?;
+
+        if !resp.status().is_success() {
+            return Err(anyhow::anyhow!("API error: {}", resp.status()));
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    pub async fn bind_unregistered_card(
+        &self,
+        req: BindUnregisteredCardRequest,
+    ) -> Result<BindUnregisteredCardResponse> {
+        let mut request = self
+            .client
+            .post(format!("{}/terminals/me/cards/bind", self.base_url))
+            .json(&req);
+        if let Some(token) = &self.api_token {
+            request = request.bearer_auth(token);
+        }
+        let resp = request.send().await?;
+
+        if !resp.status().is_success() {
+            return Err(anyhow::anyhow!("API error: {}", resp.status()));
+        }
 
         Ok(resp.json().await?)
     }

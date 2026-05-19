@@ -122,6 +122,73 @@ impl SqliteRepository {
         Ok(())
     }
 
+    pub async fn bind_new_card_from_terminal(
+        &self,
+        card_id: &CardId,
+        employee_id: Uuid,
+        terminal_id: Uuid,
+    ) -> Result<Card, RepoError> {
+        let mut tx = self.pool.begin().await.map_err(to_repo_error)?;
+
+        let card_uuid = Uuid::now_v7();
+        let now = Zoned::now();
+        let card_uuid_str = card_uuid.to_string();
+        let employee_id_str = employee_id.to_string();
+        let now_str = now.to_string();
+
+        sqlx::query(
+            r#"
+            INSERT INTO card (id, employee_id, card_identifier, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&card_uuid_str)
+        .bind(&employee_id_str)
+        .bind(&card_id.0)
+        .bind(&now_str)
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await
+        .map_err(to_repo_error)?;
+
+        let card = sqlx::query("SELECT * FROM card WHERE id = ?")
+            .bind(&card_uuid_str)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(to_repo_error)
+            .and_then(map_card_row)?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO audit_log (id, actor_type, actor_id, action, target_type, target_id, before_json, after_json, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind("terminal")
+        .bind(terminal_id.to_string())
+        .bind("card.bind")
+        .bind("card")
+        .bind(card.id.to_string())
+        .bind(Option::<String>::None)
+        .bind(serde_json::to_string(&card).map_err(|e| RepoError::Db(e.to_string()))?)
+        .bind(
+            serde_json::json!({
+                "employee_id": employee_id,
+                "source": "terminal_unregistered_card_flow",
+            })
+            .to_string(),
+        )
+        .bind(now_str)
+        .execute(&mut *tx)
+        .await
+        .map_err(to_repo_error)?;
+
+        tx.commit().await.map_err(to_repo_error)?;
+
+        Ok(card)
+    }
+
     pub async fn authenticate_admin_session(
         &self,
         session_id: &str,

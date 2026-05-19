@@ -13,8 +13,14 @@ type SubmittedPunch = {
   event_type: PunchType
 }
 
+type BoundCard = {
+  card_id: string
+  employee_id: string
+}
+
 const scannedCardId = '0123456789ABCDEF'
 const submittedPunches: SubmittedPunch[] = []
+const boundCards: BoundCard[] = []
 const listeners = new Map<string, Listener<string>[]>()
 
 function addListener(eventName: string, handler: Listener<string>) {
@@ -57,6 +63,27 @@ async function invoke(command: string, args?: InvokeArgs) {
     }
   }
 
+  if (command === 'list_active_employees') {
+    return [{ id: 'emp-terminal-e2e-1', display_name: '山田 太郎' }]
+  }
+
+  if (command === 'bind_unregistered_card') {
+    const params = (args?.params ?? {}) as Partial<BoundCard>
+    boundCards.push({
+      card_id: params.card_id ?? scannedCardId,
+      employee_id: params.employee_id ?? 'emp-terminal-e2e-1',
+    })
+
+    return {
+      card: {
+        id: 'card-terminal-e2e-1',
+        employee_id: params.employee_id ?? 'emp-terminal-e2e-1',
+        card_identifier: params.card_id ?? scannedCardId,
+      },
+      employee: { id: params.employee_id ?? 'emp-terminal-e2e-1', display_name: '山田 太郎' },
+    }
+  }
+
   if (command === 'submit_punch') {
     const params = (args?.params ?? {}) as Partial<SubmittedPunch>
     submittedPunches.push({
@@ -82,8 +109,10 @@ export const terminalE2eMocks = {
   controls: {
     emitCardScanned: () => emit('card-scanned', scannedCardId),
     submittedPunches: () => [...submittedPunches],
+    boundCards: () => [...boundCards],
     reset: () => {
       submittedPunches.length = 0
+      boundCards.length = 0
     },
   },
 }

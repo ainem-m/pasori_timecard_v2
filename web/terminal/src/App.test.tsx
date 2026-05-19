@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 
@@ -141,5 +141,94 @@ describe('Terminal App', () => {
 
     expect(invoke).not.toHaveBeenCalledWith('resolve_card', expect.anything())
     expect(invoke).not.toHaveBeenCalledWith('submit_punch', expect.anything())
+  })
+
+  it('未登録カードではカードIDを隠して従業員選択を表示する', async () => {
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === 'check_clock_sync') return { is_synced: true, offset_seconds: 0 }
+      if (command === 'get_reader_status') return 'Ready'
+      if (command === 'resolve_card') return { status: 'unregistered', card_id: '0123456789ABCDEF' }
+      if (command === 'list_active_employees') return [{ id: 'emp-1', display_name: '山田太郎' }]
+      return null
+    })
+
+    render(<App />)
+    await waitFor(() => expect(listen).toHaveBeenCalledWith('card-scanned', expect.any(Function)))
+
+    await eventMockState.cardScannedHandler?.({ payload: '0123456789ABCDEF' })
+
+    expect(await screen.findByRole('heading', { name: '未登録カード' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '山田太郎' })).toBeInTheDocument()
+    expect(screen.queryByText(/0123456789ABCDEF/)).not.toBeInTheDocument()
+  })
+
+  it('従業員を選んで登録するとカード登録の成功表示を出し打刻は送信しない', async () => {
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === 'check_clock_sync') return { is_synced: true, offset_seconds: 0 }
+      if (command === 'get_reader_status') return 'Ready'
+      if (command === 'resolve_card') return { status: 'unregistered', card_id: '0123456789ABCDEF' }
+      if (command === 'list_active_employees') return [{ id: 'emp-1', display_name: '山田太郎' }]
+      if (command === 'bind_unregistered_card') {
+        return {
+          employee: { id: 'emp-1', display_name: '山田太郎' },
+          card: { id: 'card-1', employee_id: 'emp-1', card_identifier: '0123456789ABCDEF' },
+        }
+      }
+      return null
+    })
+
+    render(<App />)
+    await waitFor(() => expect(listen).toHaveBeenCalledWith('card-scanned', expect.any(Function)))
+    await eventMockState.cardScannedHandler?.({ payload: '0123456789ABCDEF' })
+
+    fireEvent.click(await screen.findByRole('button', { name: '山田太郎' }))
+    fireEvent.click(screen.getByRole('button', { name: '登録' }))
+
+    expect(await screen.findByText('山田太郎に登録しました')).toBeInTheDocument()
+    expect(invoke).toHaveBeenCalledWith('bind_unregistered_card', {
+      params: {
+        card_id: '0123456789ABCDEF',
+        employee_id: 'emp-1',
+      },
+    })
+    expect(invoke).not.toHaveBeenCalledWith('submit_punch', expect.anything())
+    expect(screen.getByText('カード登録')).toBeInTheDocument()
+  })
+
+  it('従業員一覧を取得できない場合は再試行案内を表示する', async () => {
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === 'check_clock_sync') return { is_synced: true, offset_seconds: 0 }
+      if (command === 'get_reader_status') return 'Ready'
+      if (command === 'resolve_card') return { status: 'unregistered', card_id: '0123456789ABCDEF' }
+      if (command === 'list_active_employees') throw new Error('offline')
+      return null
+    })
+
+    render(<App />)
+    await waitFor(() => expect(listen).toHaveBeenCalledWith('card-scanned', expect.any(Function)))
+
+    await eventMockState.cardScannedHandler?.({ payload: '0123456789ABCDEF' })
+
+    expect(await screen.findByText('しばらくしてもう一度試してください')).toBeInTheDocument()
+  })
+
+  it('カード登録に失敗した場合は再試行案内を表示する', async () => {
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === 'check_clock_sync') return { is_synced: true, offset_seconds: 0 }
+      if (command === 'get_reader_status') return 'Ready'
+      if (command === 'resolve_card') return { status: 'unregistered', card_id: '0123456789ABCDEF' }
+      if (command === 'list_active_employees') return [{ id: 'emp-1', display_name: '山田太郎' }]
+      if (command === 'bind_unregistered_card') throw new Error('conflict')
+      return null
+    })
+
+    render(<App />)
+    await waitFor(() => expect(listen).toHaveBeenCalledWith('card-scanned', expect.any(Function)))
+    await eventMockState.cardScannedHandler?.({ payload: '0123456789ABCDEF' })
+
+    fireEvent.click(await screen.findByRole('button', { name: '山田太郎' }))
+    fireEvent.click(screen.getByRole('button', { name: '登録' }))
+
+    expect(await screen.findByText('もう一度試してください')).toBeInTheDocument()
   })
 })

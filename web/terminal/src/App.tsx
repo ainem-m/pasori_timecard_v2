@@ -29,9 +29,17 @@ type ResolveCardResponse =
 
 type ScanResult = 
   | { status: 'registered', data: RegisteredResponse }
-  | { status: 'unregistered', card_id: string }
+  | { status: 'unregistered', card_id: string, employees: Employee[] }
+  | { status: 'binding_confirm', card_id: string, employee: Employee }
+  | { status: 'card_bound', employee_name: string }
   | { status: 'error', message: string }
   | { status: 'success', employee_name: string, punch_type: PunchType };
+
+interface RecentActivity {
+  label: string;
+  employee_name: string;
+  at: Date;
+}
 
 interface ClockStatus {
   is_synced: boolean;
@@ -87,6 +95,7 @@ function App() {
   const [clockError, setClockError] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState(new Date());
   const [suggestedType, setSuggestedType] = useState<PunchType>('ClockIn');
+  const [recentActivities, setRecentActivities] = useState<RecentActivity[]>([]);
   
   // Long press handling
   const [isPressing, setIsPressing] = useState(false);
@@ -186,8 +195,13 @@ function App() {
           setSuggestedType(data.suggested_type);
           setCountdown(COUNTDOWN_MAX);
         } else {
-          setScanResult({ status: 'unregistered', card_id: res.card_id });
-          setTimeout(() => setScanResult(null), 5000);
+          try {
+            const employees = await tauriInvoke('list_active_employees') as Employee[];
+            setScanResult({ status: 'unregistered', card_id: res.card_id, employees });
+          } catch {
+            setScanResult({ status: 'error', message: 'しばらくしてもう一度試してください' });
+            setTimeout(() => setScanResult(null), 5000);
+          }
         }
       } catch {
         setScanResult({ status: 'error', message: 'サーバーまたはカードの解析に失敗しました。' });
@@ -231,6 +245,36 @@ function App() {
     if (longPressTimer.current) {
       clearTimeout(longPressTimer.current);
       longPressTimer.current = null;
+    }
+  };
+
+  const selectEmployeeForBinding = (card_id: string, employee: Employee) => {
+    setScanResult({ status: 'binding_confirm', card_id, employee });
+  };
+
+  const bindUnregisteredCard = async (card_id: string, employee: Employee) => {
+    if (isSubmitting) return;
+
+    setIsSubmitting(true);
+    try {
+      await tauriInvoke('bind_unregistered_card', {
+        params: {
+          card_id,
+          employee_id: employee.id,
+        },
+      });
+
+      setRecentActivities(prev => [
+        { label: 'カード登録', employee_name: employee.display_name, at: new Date() },
+        ...prev,
+      ].slice(0, 5));
+      setScanResult({ status: 'card_bound', employee_name: employee.display_name });
+      setTimeout(() => setScanResult(null), 3000);
+    } catch {
+      setScanResult({ status: 'error', message: 'もう一度試してください' });
+      setTimeout(() => setScanResult(null), 5000);
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -280,6 +324,17 @@ function App() {
             <h2 className="text-6xl font-black tracking-tight">カードをタッチ</h2>
             <p className="text-2xl font-medium opacity-30">PaSoRi 打刻ターミナル</p>
           </div>
+          {recentActivities.length > 0 && (
+            <div className="glass w-full max-w-xl rounded-3xl p-6 text-left space-y-4">
+              <p className="text-xs font-bold uppercase tracking-widest opacity-40">Recent Records</p>
+              {recentActivities.map((activity) => (
+                <div key={`${activity.label}-${activity.employee_name}-${activity.at.toISOString()}`} className="flex items-center justify-between gap-6">
+                  <span className="text-2xl font-black">{activity.label}</span>
+                  <span className="text-xl font-bold opacity-60">{activity.employee_name}</span>
+                </div>
+              ))}
+            </div>
+          )}
           
           <style>{`
             @keyframes pulse-slow {
@@ -288,6 +343,60 @@ function App() {
             }
             .animate-pulse-slow { animation: pulse-slow 3s ease-in-out infinite; }
           `}</style>
+        </div>
+      )}
+
+      {/* Card Binding: Employee Selection */}
+      {scanResult?.status === 'unregistered' && (
+        <div className="glass w-full max-w-3xl rounded-[3rem] p-12 flex flex-col items-center space-y-8 animate-in text-center">
+          <div className="w-24 h-24 text-primary-blue"><Icons.Card /></div>
+          <div className="space-y-3">
+            <h2 className="text-5xl font-black">未登録カード</h2>
+            <p className="text-2xl opacity-60 font-bold">登録する従業員を選択してください</p>
+          </div>
+          <div className="grid grid-cols-2 gap-4 w-full">
+            {scanResult.employees.map((employee) => (
+              <button
+                key={employee.id}
+                onClick={() => selectEmployeeForBinding(scanResult.card_id, employee)}
+                className="py-8 px-6 rounded-3xl bg-white/5 hover:bg-white/10 text-3xl font-black transition-all"
+              >
+                {employee.display_name}
+              </button>
+            ))}
+          </div>
+          <button
+            onClick={() => setScanResult(null)}
+            className="w-full py-6 bg-white/5 hover:bg-white/10 rounded-3xl font-black text-2xl"
+          >
+            戻る
+          </button>
+        </div>
+      )}
+
+      {/* Card Binding: Confirmation */}
+      {scanResult?.status === 'binding_confirm' && (
+        <div className="glass w-full max-w-2xl rounded-[3rem] p-12 flex flex-col items-center space-y-8 animate-in text-center">
+          <div className="w-24 h-24 text-primary-blue"><Icons.User /></div>
+          <div className="space-y-3">
+            <h2 className="text-5xl font-black">カード登録</h2>
+            <p className="text-3xl font-bold opacity-70">{scanResult.employee.display_name}</p>
+          </div>
+          <div className="grid grid-cols-2 gap-4 w-full">
+            <button
+              onClick={() => setScanResult(null)}
+              className="py-8 bg-white/5 hover:bg-white/10 rounded-3xl font-black text-2xl"
+            >
+              戻る
+            </button>
+            <button
+              onClick={() => bindUnregisteredCard(scanResult.card_id, scanResult.employee)}
+              disabled={isSubmitting}
+              className="py-8 bg-white text-primary-blue hover:scale-[1.02] disabled:opacity-50 rounded-3xl font-black text-2xl transition-all"
+            >
+              登録
+            </button>
+          </div>
         </div>
       )}
 
@@ -403,22 +512,36 @@ function App() {
         </div>
       )}
 
+      {/* Card Bound Screen */}
+      {scanResult?.status === 'card_bound' && (
+        <div className="flex flex-col items-center space-y-12 animate-in">
+          <div className="w-32 h-32 bg-green-500 rounded-full flex items-center justify-center text-white scale-125 shadow-[0_0_80px_rgba(34,197,94,0.4)]">
+            <Icons.Check />
+          </div>
+          <div className="text-center space-y-4">
+            <h2 className="text-7xl font-black tracking-tight">登録完了</h2>
+            <p className="text-3xl font-bold opacity-60">{scanResult.employee_name}に登録しました</p>
+          </div>
+          {recentActivities.slice(0, 1).map((activity) => (
+            <div key={`${activity.label}-${activity.employee_name}-${activity.at.toISOString()}`} className="glass rounded-3xl py-6 px-10 flex items-center gap-8">
+              <span className="text-2xl font-black">{activity.label}</span>
+              <span className="text-xl font-bold opacity-60">{activity.employee_name}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Unregistered / Error */}
-      {(scanResult?.status === 'unregistered' || scanResult?.status === 'error') && (
+      {scanResult?.status === 'error' && (
         <div className="glass max-w-2xl rounded-[3rem] p-16 flex flex-col items-center space-y-10 animate-in text-center">
           <div className="w-24 h-24 text-red-500 fill-red-500/10"><Icons.Alert /></div>
           <div className="space-y-4 text-center">
             <h2 className="text-5xl font-black text-red-500">
-              {scanResult.status === 'unregistered' ? '未登録カード' : 'システムエラー'}
+              システムエラー
             </h2>
             <p className="text-2xl opacity-60 leading-relaxed font-bold">
-              {scanResult.status === 'unregistered' 
-                ? 'このカードは登録されていません。' 
-                : scanResult.message}
+              {scanResult.message}
             </p>
-            {scanResult.status === 'unregistered' && (
-              <code className="block bg-white/5 py-4 px-6 rounded-2xl text-xl font-mono text-white/40">ID: {scanResult.card_id}</code>
-            )}
           </div>
           <button 
             onClick={() => setScanResult(null)}

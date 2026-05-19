@@ -39,6 +39,29 @@ Authorization: Bearer <token>
 Content-Type: application/json
 ```
 
+Terminal API token は、MVP では未登録カードの端末側紐付けにも使用する。
+操作者個人の認証は挟まず、Terminal 単位で監査する。
+
+Terminal token で利用できるカード紐付け API:
+
+- `GET /api/terminals/me/employees`
+  - 有効従業員一覧を返す
+  - Terminal の未登録カード紐付け画面で使用する
+- `POST /api/terminals/me/cards/bind`
+  - `card_id` と `employee_id` を受け取り、カードを従業員に紐付ける
+  - 既に有効なカードとして紐付いている場合は付け替えない
+  - Server は `card.bind` を `audit_log` に記録する
+  - `actor_type = "terminal"`, `actor_id = terminal.id`
+  - `metadata_json.source = "terminal_unregistered_card_flow"`
+
+リスク低減:
+
+- 有効従業員のみ選択可能
+- Terminal 画面で確認画面を出す
+- オンライン時のみ登録可能
+- Admin Web から解除・付け替え可能
+- Terminal 単位の audit_log を必ず残す
+
 ### Admin Web の Terminal 管理 API
 
 - `GET /api/admin/terminals`

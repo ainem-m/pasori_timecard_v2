@@ -10,6 +10,16 @@ description = "Allows resolving a card ID to an employee via the server"
 commands.allow = ["resolve_card"]
 
 [[permission]]
+identifier = "allow-list-active-employees"
+description = "Allows listing active employees for terminal-side card binding"
+commands.allow = ["list_active_employees"]
+
+[[permission]]
+identifier = "allow-bind-unregistered-card"
+description = "Allows binding an unregistered card to an employee from the terminal"
+commands.allow = ["bind_unregistered_card"]
+
+[[permission]]
 identifier = "allow-submit-punch"
 description = "Allows submitting a punch event (clock-in/out)"
 commands.allow = ["submit_punch"]
