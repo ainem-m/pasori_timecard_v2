@@ -833,4 +833,6 @@ fn parse_hhmm_time(input: &str) -> Option<(i8, i8)> {
 }
 
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;
