@@ -224,7 +224,7 @@ async fn returns_monthly_timesheet_for_employee_and_year_month() {
         employee_id,
         card_id,
         "clock_out",
-        "2026-04-15T18:00:00+09:00[Asia/Tokyo]",
+        "2026-04-15T20:00:00+09:00[Asia/Tokyo]",
     )
     .await;
     insert_punch(
@@ -290,7 +290,10 @@ async fn returns_monthly_timesheet_for_employee_and_year_month() {
     assert_eq!(json["period_start"], "2026-03-16");
     assert_eq!(json["period_end"], "2026-04-15");
     assert_eq!(json["days"].as_array().expect("days array").len(), 2);
-    assert_eq!(json["total_work_minutes"], 1050);
+    assert_eq!(json["total_work_minutes"], 1170);
+    assert_eq!(json["policy_profile"], "legacy_regular_2026");
+    assert_eq!(json["derived_totals"]["fixed_time_extra_minutes"], 60);
+    assert_eq!(json["days"][1]["derived"]["fixed_time_extra_minutes"], 60);
 }
 
 #[tokio::test]

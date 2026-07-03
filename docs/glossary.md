@@ -20,6 +20,11 @@
 | `ManualCorrection` | 手動修正 | 管理者が作成した打刻 (`source = manual`)。 |
 | `AttendanceDay` | 日次勤怠 | ある従業員の 1 日分。ペアリングと勤務時間を計算した結果。永続化しない (計算結果)。 |
 | `MonthlyTimesheet` | 月次勤怠表 | 締め日ベースの 1 ヶ月分の集計。 |
+| `PolicyProfile` | 勤怠ポリシー | 従業員または雇用区分に割り当てる勤怠集計 preset。MVP では `legacy_regular_2026` / `legacy_part_time_2026` / `legacy_doctor_2026`。 |
+| `DerivedAttendance` | 補助集計 | raw 打刻から policy profile で算出する帳票・給与補助用の値。DB 正本ではない。 |
+| `fixed_time_extra` | 残業 | 固定時刻以降の補助集計分類。院内正社員 MVP では平日 `19:00` 以降を帳票上 `残業` と表示する。法定時間外そのものとは限らない。 |
+| `within_8h_work_minutes` | 8時間以内 | パート MVP で使う、8 時間以内の勤務時間補助集計。 |
+| `over_8h_work_minutes` | 8時間超 | パート MVP で使う、8 時間を超えた勤務時間補助集計。 |
 | `YearMonth` | 対象年月 | 月次勤怠表の集計単位。 |
 | `CutoffRule` | 締めルール | `DayOfMonth` または `EndOfMonth`。 |
 | `DayOfMonth` | 日締め | `1..=28` の固定日締め。 |

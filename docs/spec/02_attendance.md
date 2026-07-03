@@ -13,6 +13,13 @@
 正本は `punch_event` テーブル。ビューとして `AttendanceDay` / `MonthlyTimesheet`
 をアプリケーション層で組み立てる (永続化はしない)。
 
+`punch_event.occurred_at` は実打刻時刻を保存する。丸め、休憩控除、有給日数、
+帳票上の `残業` などは raw 打刻から算出する derived value であり、
+`punch_event` を上書きしない。
+
+MVP の勤怠集計は `PolicyProfile` preset によって切り替える。雇用区分は
+policy profile の既定割当キーであり、雇用区分そのものに計算ロジックを埋め込まない。
+
 ## 勤怠表のビュー
 
 ### AttendanceDay (1 日分)
@@ -20,8 +27,12 @@
 - `date`: 対象日
 - `events`: その日の `PunchEvent` の配列 (時系列順)
 - `work_minutes`: 就業時間 (分単位)
+- `derived`: policy profile による補助集計値 (丸め後勤務時間、有給日数、帳票用分類など)
 - `has_inconsistency`: 不整合フラグ (後述)
 - `status`: `unconfirmed` / `confirmed` / `locked` (締め済み)
+
+`status` は承認/締め状態を表す。出勤、欠勤、半休、遅刻、早退などの勤務状態は
+将来 `attendance_mark` として別概念で追加する。MVP では `status` に勤務状態を混ぜない。
 
 ### MonthlyTimesheet (1 ヶ月分)
 
@@ -29,8 +40,10 @@
 - `year_month`: 対象期間
 - `days`: `AttendanceDay` の配列
 - `total_work_minutes`
+- `derived_totals`: policy profile による月次補助集計値
 - `cutoff_rule`: 締めルール (例: 15日締め / 月末締め)
 - `period_start`, `period_end`: 実際の期間 (例: 前月 16 日 〜 当月 15 日)
+- `policy_profile`: 適用した policy preset 名
 
 ## 締め日
 
@@ -60,13 +73,124 @@
 ### MVP 実装
 
 - 同日の ClockIn 〜 ClockOut をペアにして差分 (分単位) を合算
-- 休憩控除は行わない (MVP では `default_break_minutes` の概念のみ、減算しない)
+- raw 打刻は丸めない。丸めは policy profile の derived value にのみ適用する
+- 基本の `work_minutes` は raw 打刻ベースの参考値とし、給与・帳票用の値は policy profile ごとに算出する
 - 打刻種別が ClockIn, ClockOut 以外 (将来拡張) は現時点では集計対象外
+
+### PolicyProfile preset
+
+MVP では以下 3 つの preset を持つ。詳細な判断理由は ADR 0015 / ADR 0016 に従う。
+
+#### `legacy_regular_2026`
+
+対象:
+
+- 正社員
+
+前提:
+
+- 院内では 1 年単位の変形労働時間制を前提に紙の年間カレンダー、紙シフト表、
+  紙の給与最終計算を併用する
+- v2 MVP は年間変形制の完全判定を行わず、紙計算の補助集計を提供する
+- 年間カレンダーは 3 月 16 日から翌 3 月 15 日
+- 月次勤怠は 15 日締め
+
+通常勤務:
+
+- `08:30-12:55`
+- `14:00-16:00`
+- `16:15-19:00`
+- 所定終業時刻は `19:00`
+
+derived value:
+
+- `fixed_time_extra_minutes`: 平日 `19:00` 以降の勤務を帳票上 `残業` として集計する
+- `paid_leave_days`: `有給 = 1 日`, `AM有給 = 0.5 日`, `PM有給 = 0.50 日`
+- `attendance_notes`: `振替`, `AM振替`, `PM振替` は表示するが、MVP では pair 管理しない
+
+半日有給の参照時間帯:
+
+- `AM有給`: `08:30-13:00`
+- `PM有給`: `14:00-19:00`
+
+非目的:
+
+- 年間総労働時間の完全自動整合
+- 振替勤務と振替休みの 1 対 1 管理 UI
+- 振替差分の分単位精算
+- 年間変形制の法令適合判定
+
+#### `legacy_part_time_2026`
+
+対象:
+
+- パート
+
+丸め:
+
+- 出勤時刻は 30 分単位で切り上げる
+- 退勤時刻は丸めない
+- raw 打刻は変更しない
+
+勤務区間:
+
+- `ClockIn` / `ClockOut` の valid pairs を合算する
+- 休憩時は `退勤 -> 出勤` で打刻する
+- 通常休憩は 1 回で、現行帳票の 2 ペア表示に収まる前提
+
+derived value:
+
+- `counted_work_minutes`: 出勤丸め適用後の勤務時間
+- `within_8h_work_minutes`: 8 時間以内の勤務時間
+- `over_8h_work_minutes`: 8 時間を超えた勤務時間
+- `paid_leave_days`: `有給 = 1 日`, `AM有給 = 0.50 日`, `PM有給 = 0.50 日`
+
+備考:
+
+- 有給系だけ給与補助集計に効く
+- `追加残業` は MVP では使わない
+- その他備考は表示・確認用
+
+#### `legacy_doctor_2026`
+
+対象:
+
+- ドクター
+
+主集計:
+
+- 出勤日数
+- 有給日数
+
+derived value:
+
+- `work_days`: 出勤日数
+- `paid_leave_days`: `有給 = 1 日`, `AM有給 = 0.50 日`, `PM有給 = 0.50 日`
+- `reference_work_minutes`: 勤務時間の参考表示。給与値にはしない
+
+非目的:
+
+- ドクターの残業主集計
+- ドクターの勤務時間を給与値として扱うこと
+
+### 備考欄
+
+MVP で構造化対象とする備考は以下に絞る。
+
+- `有給`
+- `AM有給`
+- `PM有給`
+- `振替`
+- `AM振替`
+- `PM振替`
+
+その他備考は表示・確認用であり、給与補助集計には入れない。
 
 ### 丸め
 
 - `RoundingPolicy` trait (`core::rounding`) で切り替え可能
-- MVP 実装は `NoRounding` (素通し)
+- raw 打刻保存の既定は常に `NoRounding` (素通し)
+- policy profile による帳票/集計用丸めは derived value として適用する
 - 将来追加: 出勤のみ切り上げ、退勤は 1 分単位、などのポリシー
 
 ### 不整合フラグ (has_inconsistency)
@@ -118,12 +242,28 @@ UI では ⚠️ マークで表示。
 ## CSV / Excel エクスポート
 
 - Admin Web の画面に「月次エクスポート」ボタン
-- CSV: 従業員 × 日付 × 打刻時刻 + 勤務時間合計
-- Excel: 同上 + 書式 (締め日区切り、不整合ハイライト)
+- CSV: 従業員 × 日付 × 打刻時刻 + policy profile ごとの補助集計値
+- Excel: 同上 + 書式 (締め日区切り、不整合ハイライト、院内帳票互換列)
 - ただし内部の**正本は DB**。CSV/Excel は出力専用でインポート機能はない
+- CSV/Excel は給与計算エンジンではなく、紙計算・確認用の補助資料である
+
+## MVP 非目的
+
+- 給与計算エンジン
+- 年間変形労働時間制の法令適合判定
+- 年間総労働時間の完全自動整合
+- 振替勤務と振替休みの 1 対 1 管理 UI
+- 振替差分の分単位精算
+- `追加残業` の自動集計
+- 複数休憩への帳票完全対応
+- 法定休憩不足の自動確定判定
 
 ## TDD 対象
 
 - 締め日計算 (proptest: 任意の year_month, cutoff_rule に対し、期間が 1 ヶ月 ±1 日以内)
 - ペアリング (proptest: 任意の打刻列に対し、不整合フラグが想定通り)
 - 勤務時間集計
+- raw 打刻が policy 丸めで変更されないこと
+- `legacy_regular_2026`: `19:00` 以降だけ `fixed_time_extra` に入ること
+- `legacy_part_time_2026`: 出勤 30 分切り上げ、退勤丸めなし、8 時間以内/8 時間超の分離
+- `legacy_doctor_2026`: 出勤日数・有給日数が主集計で、勤務時間は参考表示に留まること

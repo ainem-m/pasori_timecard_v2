@@ -328,7 +328,7 @@ mod tests {
         build_attendance_day, build_monthly_timesheet, compare_with_shift,
         decide_attendance_request_status,
     };
-    use crate::domain::punch::{AttendanceDayStatus, NewPunchEvent};
+    use crate::domain::punch::{AttendanceDayStatus, DerivedAttendance, NewPunchEvent};
     use crate::domain::request::{AttendanceRequestStatus, AttendanceRequestType};
     use crate::domain::time::{CutoffDay, CutoffRule, TimeDomainError, YearMonth};
     use crate::port::policy::{NoRounding, PunchEventType};
@@ -631,6 +631,7 @@ mod tests {
             date: date(2026, 4, 16),
             events,
             work_minutes: 0,
+            derived: DerivedAttendance::default(),
             has_inconsistency: false,
             status: AttendanceDayStatus::Confirmed,
         }
@@ -641,6 +642,7 @@ mod tests {
             date,
             events: vec![],
             work_minutes,
+            derived: DerivedAttendance::default(),
             has_inconsistency: false,
             status: AttendanceDayStatus::Confirmed,
         }
