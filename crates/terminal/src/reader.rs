@@ -179,7 +179,7 @@ fn poll_loop(
                                 return;
                             }
                         };
-                        tracing::info!(card_id = %idm_hex, "card scanned");
+                        tracing::info!("{}", crate::logging::card_scanned_message(&idm_hex));
                         let _ = tx.send(CardScanned {
                             card_id: CardId(idm_hex),
                             scanned_at,

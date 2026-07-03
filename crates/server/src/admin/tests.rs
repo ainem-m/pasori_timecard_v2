@@ -400,6 +400,115 @@ async fn approves_requested_correction_and_applies_punch_update() {
 }
 
 #[tokio::test]
+// 監査ログの記録に失敗した承認は、打刻更新と申請状態変更をロールバックする。
+async fn rolls_back_punch_update_when_approval_audit_log_fails() {
+    let (app, pool) = test_app_with_pool().await;
+    let employee_id = Uuid::now_v7();
+    let card_id = Uuid::now_v7();
+    let request_id = Uuid::now_v7();
+
+    insert_employee(&pool, employee_id).await;
+    insert_card(&pool, card_id, employee_id).await;
+    insert_punch(
+        &pool,
+        employee_id,
+        card_id,
+        "clock_in",
+        "2026-04-15T09:00:00+09:00[Asia/Tokyo]",
+    )
+    .await;
+    insert_attendance_request(
+        &pool,
+        request_id,
+        employee_id,
+        "correction",
+        r#"{"date":"2026-04-15","target":"clock_in","time":"08:32"}"#,
+        "requested",
+    )
+    .await;
+
+    let cookie = login_and_extract_cookie(app.clone()).await;
+    sqlx::query(
+        r#"
+        CREATE TRIGGER fail_audit_log_insert
+        BEFORE INSERT ON audit_log
+        BEGIN
+            SELECT RAISE(ABORT, 'audit insert disabled for test');
+        END
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("create audit insert failure trigger");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/admin/attendance_requests/{request_id}/approve"))
+                .header(axum::http::header::COOKIE, cookie)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "review_note": "承認して反映",
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let request_row = sqlx::query(
+        "SELECT status, reviewed_by_admin_user_id, reviewed_at, review_note, applied_event_id FROM attendance_request WHERE id = ?",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("attendance request row");
+    assert_eq!(request_row.get::<String, _>("status"), "requested");
+    assert!(
+        request_row
+            .get::<Option<String>, _>("reviewed_by_admin_user_id")
+            .is_none()
+    );
+    assert!(
+        request_row
+            .get::<Option<String>, _>("reviewed_at")
+            .is_none()
+    );
+    assert!(
+        request_row
+            .get::<Option<String>, _>("review_note")
+            .is_none()
+    );
+    assert!(
+        request_row
+            .get::<Option<String>, _>("applied_event_id")
+            .is_none()
+    );
+
+    let punch_row = sqlx::query(
+        "SELECT occurred_at, correction_reason FROM punch_event WHERE employee_id = ? AND event_type = 'clock_in'",
+    )
+    .bind(employee_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("punch row");
+    assert_eq!(
+        punch_row.get::<String, _>("occurred_at"),
+        "2026-04-15T09:00:00+09:00[Asia/Tokyo]"
+    );
+    assert!(
+        punch_row
+            .get::<Option<String>, _>("correction_reason")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 // 管理者は requested の修正申請を却下でき、audit_log に却下を残す。
 async fn rejects_requested_correction_and_records_audit() {
     let (app, pool) = test_app_with_pool().await;
@@ -466,6 +575,88 @@ async fn rejects_requested_correction_and_records_audit() {
     let metadata: Value =
         serde_json::from_str(&audit_row.get::<String, _>("metadata_json")).expect("metadata json");
     assert_eq!(metadata["review_note"], "証跡不足のため差し戻し");
+}
+
+#[tokio::test]
+// 監査ログの記録に失敗した却下は、申請状態変更をロールバックする。
+async fn rolls_back_rejection_when_audit_log_fails() {
+    let (app, pool) = test_app_with_pool().await;
+    let employee_id = Uuid::now_v7();
+    let request_id = Uuid::now_v7();
+
+    insert_employee(&pool, employee_id).await;
+    insert_attendance_request(
+        &pool,
+        request_id,
+        employee_id,
+        "correction",
+        r#"{"date":"2026-04-15","target":"clock_out","time":"18:05"}"#,
+        "requested",
+    )
+    .await;
+
+    let cookie = login_and_extract_cookie(app.clone()).await;
+    sqlx::query(
+        r#"
+        CREATE TRIGGER fail_audit_log_insert
+        BEFORE INSERT ON audit_log
+        BEGIN
+            SELECT RAISE(ABORT, 'audit insert disabled for test');
+        END
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("create audit insert failure trigger");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/admin/attendance_requests/{request_id}/reject"))
+                .header(axum::http::header::COOKIE, cookie)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "review_note": "証跡不足のため差し戻し",
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let request_row = sqlx::query(
+        "SELECT status, reviewed_by_admin_user_id, reviewed_at, review_note, applied_event_id FROM attendance_request WHERE id = ?",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("attendance request row");
+    assert_eq!(request_row.get::<String, _>("status"), "requested");
+    assert!(
+        request_row
+            .get::<Option<String>, _>("reviewed_by_admin_user_id")
+            .is_none()
+    );
+    assert!(
+        request_row
+            .get::<Option<String>, _>("reviewed_at")
+            .is_none()
+    );
+    assert!(
+        request_row
+            .get::<Option<String>, _>("review_note")
+            .is_none()
+    );
+    assert!(
+        request_row
+            .get::<Option<String>, _>("applied_event_id")
+            .is_none()
+    );
 }
 
 #[tokio::test]

@@ -14,6 +14,7 @@ use pasori_core::domain::request::{
 };
 use pasori_core::domain::shift::{ShiftAssignment, ShiftType};
 use pasori_core::domain::time::YearMonth;
+use pasori_core::port::policy::PunchEventType;
 use pasori_core::port::reader::CardId;
 use pasori_core::port::repo::{
     AttendanceRequestRepository, AuditLogRepository, CardRepository, EmployeeRepository,
@@ -53,6 +54,20 @@ pub enum AdminAuthenticationResult {
     Authenticated(AdminUser),
     InvalidCredentials,
     Locked { locked_until: Zoned },
+}
+
+#[derive(Debug, Clone)]
+pub enum AttendanceApprovalOperation {
+    Correction {
+        from: Zoned,
+        to: Zoned,
+        target_event_type: PunchEventType,
+        corrected_at: Zoned,
+        reason: String,
+    },
+    MissingPunch {
+        event: NewPunchEvent,
+    },
 }
 
 mod repos;
@@ -480,6 +495,239 @@ impl SqliteRepository {
         })
     }
 
+    pub async fn approve_attendance_request_atomically(
+        &self,
+        id: Uuid,
+        reviewed_by_admin_user_id: Uuid,
+        review_note: Option<String>,
+        operation: AttendanceApprovalOperation,
+    ) -> Result<AttendanceRequest, RepoError> {
+        let mut tx = self.pool.begin().await.map_err(to_repo_error)?;
+        let existing = fetch_attendance_request_in_tx(&mut tx, id)
+            .await?
+            .ok_or(RepoError::NotFound)?;
+        existing
+            .status
+            .transition_to(AttendanceRequestStatus::Approved)
+            .map_err(|e| RepoError::Conflict(e.to_string()))?;
+
+        let reviewed_at = Zoned::now();
+        let approved_status = status_to_db_string(AttendanceRequestStatus::Approved)?;
+        sqlx::query(
+            r#"
+            UPDATE attendance_request
+            SET status = ?, reviewed_by_admin_user_id = ?, reviewed_at = ?, review_note = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(approved_status)
+        .bind(reviewed_by_admin_user_id.to_string())
+        .bind(reviewed_at.to_string())
+        .bind(review_note.clone())
+        .bind(reviewed_at.to_string())
+        .bind(id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(to_repo_error)?;
+
+        let reviewed = AttendanceRequest {
+            status: AttendanceRequestStatus::Approved,
+            reviewed_by_admin_user_id: Some(reviewed_by_admin_user_id),
+            reviewed_at: Some(reviewed_at.clone()),
+            review_note: review_note.clone(),
+            ..existing.clone()
+        };
+
+        let applied_event_id = match operation {
+            AttendanceApprovalOperation::Correction {
+                from,
+                to,
+                target_event_type,
+                corrected_at,
+                reason,
+            } => {
+                let before_punch = fetch_target_punch_in_tx(
+                    &mut tx,
+                    existing.employee_id,
+                    &from,
+                    &to,
+                    target_event_type,
+                )
+                .await?
+                .ok_or_else(|| RepoError::Conflict("target punch not found".to_string()))?;
+                let updated_punch = update_punch_in_tx(
+                    &mut tx,
+                    &before_punch,
+                    target_event_type,
+                    corrected_at,
+                    reason,
+                )
+                .await?;
+                insert_audit_log_in_tx(
+                    &mut tx,
+                    NewAuditLog {
+                        actor_type: "admin".to_string(),
+                        actor_id: Some(reviewed_by_admin_user_id.to_string()),
+                        action: "punch.update".to_string(),
+                        target_type: "punch_event".to_string(),
+                        target_id: Some(updated_punch.id.to_string()),
+                        before_json: Some(to_json_string(&before_punch)?),
+                        after_json: Some(to_json_string(&updated_punch)?),
+                        metadata_json: Some(
+                            serde_json::json!({
+                                "reason": "lineworks request approved",
+                                "attendance_request_id": id,
+                            })
+                            .to_string(),
+                        ),
+                    },
+                )
+                .await?;
+                updated_punch.id
+            }
+            AttendanceApprovalOperation::MissingPunch { event } => {
+                let punch = insert_punch_in_tx(&mut tx, event).await?;
+                insert_audit_log_in_tx(
+                    &mut tx,
+                    NewAuditLog {
+                        actor_type: "admin".to_string(),
+                        actor_id: Some(reviewed_by_admin_user_id.to_string()),
+                        action: "punch.create_manual".to_string(),
+                        target_type: "punch_event".to_string(),
+                        target_id: Some(punch.id.to_string()),
+                        before_json: None,
+                        after_json: Some(to_json_string(&punch)?),
+                        metadata_json: Some(
+                            serde_json::json!({
+                                "request_type": format!("{:?}", existing.request_type),
+                                "attendance_request_id": id,
+                            })
+                            .to_string(),
+                        ),
+                    },
+                )
+                .await?;
+                punch.id
+            }
+        };
+
+        reviewed
+            .status
+            .transition_to(AttendanceRequestStatus::Applied)
+            .map_err(|e| RepoError::Conflict(e.to_string()))?;
+        let applied_status = status_to_db_string(AttendanceRequestStatus::Applied)?;
+        sqlx::query(
+            r#"
+            UPDATE attendance_request
+            SET status = ?, applied_event_id = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(applied_status)
+        .bind(applied_event_id.to_string())
+        .bind(reviewed_at.to_string())
+        .bind(id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(to_repo_error)?;
+
+        let applied = AttendanceRequest {
+            status: AttendanceRequestStatus::Applied,
+            applied_event_id: Some(applied_event_id),
+            ..reviewed.clone()
+        };
+
+        insert_audit_log_in_tx(
+            &mut tx,
+            NewAuditLog {
+                actor_type: "admin".to_string(),
+                actor_id: Some(reviewed_by_admin_user_id.to_string()),
+                action: "request.approved".to_string(),
+                target_type: "attendance_request".to_string(),
+                target_id: Some(id.to_string()),
+                before_json: Some(to_json_string(&existing)?),
+                after_json: Some(to_json_string(&reviewed)?),
+                metadata_json: Some(
+                    serde_json::json!({
+                        "review_note": review_note,
+                        "applied_event_id": applied_event_id,
+                    })
+                    .to_string(),
+                ),
+            },
+        )
+        .await?;
+
+        tx.commit().await.map_err(to_repo_error)?;
+        Ok(applied)
+    }
+
+    pub async fn reject_attendance_request_atomically(
+        &self,
+        id: Uuid,
+        reviewed_by_admin_user_id: Uuid,
+        review_note: Option<String>,
+    ) -> Result<AttendanceRequest, RepoError> {
+        let mut tx = self.pool.begin().await.map_err(to_repo_error)?;
+        let existing = fetch_attendance_request_in_tx(&mut tx, id)
+            .await?
+            .ok_or(RepoError::NotFound)?;
+        existing
+            .status
+            .transition_to(AttendanceRequestStatus::Rejected)
+            .map_err(|e| RepoError::Conflict(e.to_string()))?;
+
+        let reviewed_at = Zoned::now();
+        let rejected_status = status_to_db_string(AttendanceRequestStatus::Rejected)?;
+        sqlx::query(
+            r#"
+            UPDATE attendance_request
+            SET status = ?, reviewed_by_admin_user_id = ?, reviewed_at = ?, review_note = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(rejected_status)
+        .bind(reviewed_by_admin_user_id.to_string())
+        .bind(reviewed_at.to_string())
+        .bind(review_note.clone())
+        .bind(reviewed_at.to_string())
+        .bind(id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(to_repo_error)?;
+
+        let rejected = AttendanceRequest {
+            status: AttendanceRequestStatus::Rejected,
+            reviewed_by_admin_user_id: Some(reviewed_by_admin_user_id),
+            reviewed_at: Some(reviewed_at),
+            review_note: review_note.clone(),
+            ..existing.clone()
+        };
+
+        insert_audit_log_in_tx(
+            &mut tx,
+            NewAuditLog {
+                actor_type: "admin".to_string(),
+                actor_id: Some(reviewed_by_admin_user_id.to_string()),
+                action: "request.rejected".to_string(),
+                target_type: "attendance_request".to_string(),
+                target_id: Some(id.to_string()),
+                before_json: Some(to_json_string(&existing)?),
+                after_json: Some(to_json_string(&rejected)?),
+                metadata_json: Some(
+                    serde_json::json!({
+                        "review_note": review_note,
+                    })
+                    .to_string(),
+                ),
+            },
+        )
+        .await?;
+
+        tx.commit().await.map_err(to_repo_error)?;
+        Ok(rejected)
+    }
+
     pub async fn find_punch_by_id(&self, id: Uuid) -> Result<Option<PunchEvent>, RepoError> {
         let row = sqlx::query("SELECT * FROM punch_event WHERE id = ?")
             .bind(id.to_string())
@@ -680,6 +928,163 @@ impl SqliteRepository {
 
         Ok(Some(admin_user_id))
     }
+}
+
+async fn fetch_attendance_request_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: Uuid,
+) -> Result<Option<AttendanceRequest>, RepoError> {
+    let row = sqlx::query("SELECT * FROM attendance_request WHERE id = ?")
+        .bind(id.to_string())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(to_repo_error)?;
+
+    row.map(map_attendance_request_row).transpose()
+}
+
+async fn fetch_target_punch_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    employee_id: Uuid,
+    from: &Zoned,
+    to: &Zoned,
+    target_event_type: PunchEventType,
+) -> Result<Option<PunchEvent>, RepoError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT * FROM punch_event
+        WHERE employee_id = ? AND occurred_at BETWEEN ? AND ? AND deleted_at IS NULL
+        ORDER BY occurred_at ASC
+        "#,
+    )
+    .bind(employee_id.to_string())
+    .bind(from.to_string())
+    .bind(to.to_string())
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(to_repo_error)?;
+
+    let punches: Result<Vec<_>, _> = rows.into_iter().map(map_punch_row).collect();
+    Ok(punches?
+        .into_iter()
+        .find(|punch| punch.event_type == target_event_type))
+}
+
+async fn update_punch_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    before: &PunchEvent,
+    event_type: PunchEventType,
+    occurred_at: Zoned,
+    reason: String,
+) -> Result<PunchEvent, RepoError> {
+    let mut punch = before.clone();
+    punch.event_type = event_type;
+    punch.occurred_at = occurred_at;
+    punch.correction_reason = Some(reason);
+    punch.updated_at = Zoned::now();
+
+    sqlx::query(
+        r#"
+        UPDATE punch_event
+        SET event_type = ?, occurred_at = ?, correction_reason = ?, updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(event_type_to_db_string(punch.event_type)?)
+    .bind(punch.occurred_at.to_string())
+    .bind(&punch.correction_reason)
+    .bind(punch.updated_at.to_string())
+    .bind(punch.id.to_string())
+    .execute(&mut **tx)
+    .await
+    .map_err(to_repo_error)?;
+
+    Ok(punch)
+}
+
+async fn insert_punch_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    event: NewPunchEvent,
+) -> Result<PunchEvent, RepoError> {
+    let now = Zoned::now();
+    let card_id = event.card_id.map(|id| id.to_string());
+    let now_str = now.to_string();
+
+    sqlx::query(
+        r#"
+        INSERT INTO punch_event (id, employee_id, card_id, event_type, occurred_at, server_recorded_at, source, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(event.id.to_string())
+    .bind(event.employee_id.to_string())
+    .bind(card_id)
+    .bind(event_type_to_db_string(event.event_type)?)
+    .bind(event.occurred_at.to_string())
+    .bind(&now_str)
+    .bind(event.source.clone())
+    .bind(&now_str)
+    .bind(&now_str)
+    .execute(&mut **tx)
+    .await
+    .map_err(to_repo_error)?;
+
+    Ok(PunchEvent {
+        id: event.id,
+        employee_id: event.employee_id,
+        card_id: event.card_id,
+        event_type: event.event_type,
+        occurred_at: event.occurred_at,
+        server_recorded_at: now.clone(),
+        source: event.source,
+        correction_reason: None,
+        deleted_at: None,
+        created_at: now.clone(),
+        updated_at: now,
+    })
+}
+
+async fn insert_audit_log_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    entry: NewAuditLog,
+) -> Result<(), RepoError> {
+    sqlx::query(
+        r#"
+        INSERT INTO audit_log (id, actor_type, actor_id, action, target_type, target_id, before_json, after_json, metadata_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(entry.actor_type)
+    .bind(entry.actor_id)
+    .bind(entry.action)
+    .bind(entry.target_type)
+    .bind(entry.target_id)
+    .bind(entry.before_json)
+    .bind(entry.after_json)
+    .bind(entry.metadata_json)
+    .bind(Zoned::now().to_string())
+    .execute(&mut **tx)
+    .await
+    .map_err(to_repo_error)?;
+
+    Ok(())
+}
+
+fn status_to_db_string(status: AttendanceRequestStatus) -> Result<String, RepoError> {
+    serde_json::to_string(&status)
+        .map(|value| value.replace('"', ""))
+        .map_err(|e| RepoError::Db(e.to_string()))
+}
+
+fn event_type_to_db_string(event_type: PunchEventType) -> Result<String, RepoError> {
+    serde_json::to_string(&event_type)
+        .map(|value| value.replace('"', ""))
+        .map_err(|e| RepoError::Db(e.to_string()))
+}
+
+fn to_json_string<T: serde::Serialize>(value: &T) -> Result<String, RepoError> {
+    serde_json::to_string(value).map_err(|e| RepoError::Db(e.to_string()))
 }
 
 fn map_employee_row(row: sqlx::sqlite::SqliteRow) -> Result<Employee, RepoError> {

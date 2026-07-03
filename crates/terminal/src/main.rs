@@ -1,6 +1,7 @@
 mod api_client;
 mod card_binding;
 mod clock;
+mod logging;
 mod offline;
 mod punch;
 mod rcs380;
@@ -53,7 +54,7 @@ async fn resolve_card(
             Ok(response)
         }
         Err(_) => {
-            tracing::info!(card_id = %card_id, "server unreachable, falling back to local cache");
+            tracing::info!("server unreachable, falling back to local cache");
             match state.offline_repo.find_cached_card(&card_id).await {
                 Ok(Some(cached)) => {
                     let recent_events: Vec<pasori_core::domain::punch::PunchEvent> =
@@ -280,7 +281,7 @@ async fn main() -> Result<()> {
             // Bridge broadcast channel to Tauri events
             tauri::async_runtime::spawn(async move {
                 while let Ok(scanned) = rx.recv().await {
-                    tracing::info!(card_id = %scanned.card_id.0, "bridge: emitting card-scanned event");
+                    tracing::info!("bridge: emitting card-scanned event");
                     let _ = reader_handle.emit("card-scanned", scanned.card_id.0);
                 }
             });
