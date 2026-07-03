@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useEffect, useState, useCallback, useRef, type PointerEvent } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 import { terminalE2eMocks } from './e2eMocks'
@@ -237,8 +237,9 @@ function App() {
     setCountdown(COUNTDOWN_MAX); // Reset countdown on change
   };
 
-  const startPress = () => {
+  const startPress = (event?: PointerEvent<HTMLButtonElement>) => {
     if (scanResult?.status !== 'registered' || isSubmitting) return;
+    event?.currentTarget.setPointerCapture(event.pointerId);
     setIsPressing(true);
     longPressTimer.current = window.setTimeout(() => {
       setIsPressing(false);
@@ -248,7 +249,10 @@ function App() {
     }, 1000);
   };
 
-  const endPress = () => {
+  const endPress = (event?: PointerEvent<HTMLButtonElement>) => {
+    if (event?.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
     setIsPressing(false);
     if (longPressTimer.current) {
       clearTimeout(longPressTimer.current);
@@ -473,11 +477,10 @@ function App() {
               CANCEL
             </button>
             <button 
-              onMouseDown={startPress}
-              onMouseUp={endPress}
-              onMouseLeave={endPress}
-              onTouchStart={startPress}
-              onTouchEnd={endPress}
+              onPointerDown={startPress}
+              onPointerUp={endPress}
+              onPointerLeave={endPress}
+              onPointerCancel={endPress}
               className={`flex-1 py-10 rounded-[2.5rem] text-4xl font-black relative overflow-hidden transition-all duration-300 ${isSubmitting ? 'scale-95 opacity-50' : 'hover:scale-[1.02] shadow-2xl'} ${
                 suggestedType === 'clock_in' ? 'bg-white text-primary-blue' : 'bg-white text-primary-orange'
               }`}
