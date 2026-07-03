@@ -475,28 +475,9 @@ impl ShiftRepository for SqliteRepository {
 #[async_trait]
 impl AuditLogRepository for SqliteRepository {
     async fn append(&self, entry: NewAuditLog) -> Result<(), RepoError> {
-        let id = Uuid::now_v7().to_string();
-        let now = Zoned::now().to_string();
-
-        sqlx::query(
-            r#"
-            INSERT INTO audit_log (id, actor_type, actor_id, action, target_type, target_id, before_json, after_json, metadata_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(id)
-        .bind(entry.actor_type)
-        .bind(entry.actor_id)
-        .bind(entry.action)
-        .bind(entry.target_type)
-        .bind(entry.target_id)
-        .bind(entry.before_json)
-        .bind(entry.after_json)
-        .bind(entry.metadata_json)
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(to_repo_error)?;
+        let mut tx = self.pool.begin().await.map_err(to_repo_error)?;
+        insert_audit_log_in_tx(&mut tx, entry).await?;
+        tx.commit().await.map_err(to_repo_error)?;
 
         Ok(())
     }

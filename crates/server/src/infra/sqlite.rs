@@ -3,9 +3,11 @@ use argon2::{
     password_hash::{PasswordHash, PasswordVerifier},
 };
 use async_trait::async_trait;
-use jiff::Zoned;
+use jiff::{Zoned, civil::Date};
 use pasori_core::domain::admin::AdminUser;
-use pasori_core::domain::audit::{AuditLog, AuditLogFilter, NewAuditLog};
+use pasori_core::domain::audit::{
+    AuditDigest, AuditLog, AuditLogChainVerification, AuditLogFilter, NewAuditLog,
+};
 use pasori_core::domain::card::Card;
 use pasori_core::domain::employee::{Employee, EmployeePatch, ExternalAccount, NewEmployee};
 use pasori_core::domain::punch::{NewPunchEvent, PunchEvent, PunchPatch};
@@ -21,6 +23,7 @@ use pasori_core::port::repo::{
     ExternalAccountRepository, PunchRepository, RepoError, ShiftRepository,
 };
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use sqlx::{Row, sqlite::SqlitePool};
 use uuid::Uuid;
 
@@ -187,38 +190,33 @@ impl SqliteRepository {
             .map_err(to_repo_error)
             .and_then(map_card_row)?;
 
-        sqlx::query(
-            r#"
-            INSERT INTO audit_log (id, actor_type, actor_id, action, target_type, target_id, before_json, after_json, metadata_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
+        insert_audit_log_in_tx(
+            &mut tx,
+            NewAuditLog {
+                actor_type: "terminal".to_string(),
+                actor_id: Some(terminal_id.to_string()),
+                action: "card.bind".to_string(),
+                target_type: "card".to_string(),
+                target_id: Some(card.id.to_string()),
+                before_json: None,
+                after_json: Some(
+                    serde_json::json!({
+                        "id": card.id,
+                        "employee_id": employee_id,
+                        "is_active": card.is_active,
+                    })
+                    .to_string(),
+                ),
+                metadata_json: Some(
+                    serde_json::json!({
+                        "employee_id": employee_id,
+                        "source": "terminal_unregistered_card_flow",
+                    })
+                    .to_string(),
+                ),
+            },
         )
-        .bind(Uuid::now_v7().to_string())
-        .bind("terminal")
-        .bind(terminal_id.to_string())
-        .bind("card.bind")
-        .bind("card")
-        .bind(card.id.to_string())
-        .bind(Option::<String>::None)
-        .bind(
-            serde_json::json!({
-                "id": card.id,
-                "employee_id": employee_id,
-                "is_active": card.is_active,
-            })
-            .to_string(),
-        )
-        .bind(
-            serde_json::json!({
-                "employee_id": employee_id,
-                "source": "terminal_unregistered_card_flow",
-            })
-            .to_string(),
-        )
-        .bind(now_str)
-        .execute(&mut *tx)
-        .await
-        .map_err(to_repo_error)?;
+        .await?;
 
         tx.commit().await.map_err(to_repo_error)?;
 
@@ -928,6 +926,113 @@ impl SqliteRepository {
 
         Ok(Some(admin_user_id))
     }
+
+    pub async fn verify_audit_log_hash_chain(
+        &self,
+    ) -> Result<AuditLogChainVerification, RepoError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM audit_log
+            ORDER BY created_at ASC, id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(to_repo_error)?;
+
+        let mut expected_prev_hash: Option<String> = None;
+        let mut checked_entries = 0;
+        let mut legacy_entries = 0;
+        let mut chain_started = false;
+
+        for row in rows {
+            let entry = map_audit_log_row(row)?;
+
+            if !chain_started && entry.prev_hash.is_none() && entry.entry_hash.is_none() {
+                legacy_entries += 1;
+                continue;
+            }
+
+            chain_started = true;
+            checked_entries += 1;
+
+            let Some(stored_hash) = entry.entry_hash.clone() else {
+                return Ok(invalid_audit_chain_result(
+                    checked_entries,
+                    legacy_entries,
+                    &entry,
+                    expected_prev_hash,
+                ));
+            };
+
+            if entry.prev_hash != expected_prev_hash {
+                return Ok(invalid_audit_chain_result(
+                    checked_entries,
+                    legacy_entries,
+                    &entry,
+                    expected_prev_hash,
+                ));
+            }
+
+            let calculated_hash = calculate_audit_entry_hash(&entry);
+            if stored_hash != calculated_hash {
+                return Ok(invalid_audit_chain_result(
+                    checked_entries,
+                    legacy_entries,
+                    &entry,
+                    expected_prev_hash,
+                ));
+            }
+
+            expected_prev_hash = Some(stored_hash);
+        }
+
+        Ok(AuditLogChainVerification {
+            is_valid: true,
+            checked_entries,
+            legacy_entries,
+            first_invalid_audit_log_id: None,
+            first_invalid_action: None,
+            last_valid_hash: expected_prev_hash,
+        })
+    }
+
+    pub async fn audit_digest_for_date(&self, date: Date) -> Result<AuditDigest, RepoError> {
+        let period_start = tokyo_start_of_day(date)?;
+        let period_end = tokyo_start_of_day(
+            date.tomorrow()
+                .map_err(|e| RepoError::Db(format!("invalid audit digest date: {e}")))?,
+        )?;
+
+        let rows = sqlx::query(
+            r#"
+            SELECT entry_hash
+            FROM audit_log
+            WHERE created_at >= ? AND created_at < ? AND entry_hash IS NOT NULL
+            ORDER BY created_at ASC, id ASC
+            "#,
+        )
+        .bind(period_start.to_string())
+        .bind(period_end.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(to_repo_error)?;
+
+        let entry_hashes: Vec<String> = rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("entry_hash"))
+            .collect();
+        let digest_hash = calculate_audit_digest_hash(date, &entry_hashes);
+
+        Ok(AuditDigest {
+            date,
+            entry_count: entry_hashes.len(),
+            first_entry_hash: entry_hashes.first().cloned(),
+            last_entry_hash: entry_hashes.last().cloned(),
+            digest_hash,
+        })
+    }
 }
 
 async fn fetch_attendance_request_in_tx(
@@ -1048,27 +1153,140 @@ async fn insert_audit_log_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     entry: NewAuditLog,
 ) -> Result<(), RepoError> {
+    let id = Uuid::now_v7();
+    let created_at = Zoned::now();
+    let prev_hash = latest_audit_entry_hash_in_tx(tx).await?;
+    let audit_log = AuditLog {
+        id,
+        actor_type: entry.actor_type,
+        actor_id: entry.actor_id,
+        action: entry.action,
+        target_type: entry.target_type,
+        target_id: entry.target_id,
+        before_json: entry.before_json,
+        after_json: entry.after_json,
+        metadata_json: entry.metadata_json,
+        created_at,
+        prev_hash,
+        entry_hash: None,
+    };
+    let entry_hash = calculate_audit_entry_hash(&audit_log);
+
     sqlx::query(
         r#"
-        INSERT INTO audit_log (id, actor_type, actor_id, action, target_type, target_id, before_json, after_json, metadata_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO audit_log (id, actor_type, actor_id, action, target_type, target_id, before_json, after_json, metadata_json, created_at, prev_hash, entry_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
-    .bind(Uuid::now_v7().to_string())
-    .bind(entry.actor_type)
-    .bind(entry.actor_id)
-    .bind(entry.action)
-    .bind(entry.target_type)
-    .bind(entry.target_id)
-    .bind(entry.before_json)
-    .bind(entry.after_json)
-    .bind(entry.metadata_json)
-    .bind(Zoned::now().to_string())
+    .bind(audit_log.id.to_string())
+    .bind(audit_log.actor_type)
+    .bind(audit_log.actor_id)
+    .bind(audit_log.action)
+    .bind(audit_log.target_type)
+    .bind(audit_log.target_id)
+    .bind(audit_log.before_json)
+    .bind(audit_log.after_json)
+    .bind(audit_log.metadata_json)
+    .bind(audit_log.created_at.to_string())
+    .bind(audit_log.prev_hash)
+    .bind(entry_hash)
     .execute(&mut **tx)
     .await
     .map_err(to_repo_error)?;
 
     Ok(())
+}
+
+async fn latest_audit_entry_hash_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<Option<String>, RepoError> {
+    let row = sqlx::query(
+        r#"
+        SELECT entry_hash
+        FROM audit_log
+        WHERE entry_hash IS NOT NULL
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(to_repo_error)?;
+
+    Ok(row.map(|row| row.get::<String, _>("entry_hash")))
+}
+
+fn invalid_audit_chain_result(
+    checked_entries: usize,
+    legacy_entries: usize,
+    entry: &AuditLog,
+    last_valid_hash: Option<String>,
+) -> AuditLogChainVerification {
+    AuditLogChainVerification {
+        is_valid: false,
+        checked_entries,
+        legacy_entries,
+        first_invalid_audit_log_id: Some(entry.id),
+        first_invalid_action: Some(entry.action.clone()),
+        last_valid_hash,
+    }
+}
+
+fn calculate_audit_entry_hash(entry: &AuditLog) -> String {
+    let mut input = String::from("pasori-timecard:audit-log-entry:v1\n");
+    let id = entry.id.to_string();
+    let created_at = entry.created_at.to_string();
+    push_hash_field(&mut input, "id", Some(&id));
+    push_hash_field(&mut input, "actor_type", Some(&entry.actor_type));
+    push_hash_field(&mut input, "actor_id", entry.actor_id.as_deref());
+    push_hash_field(&mut input, "action", Some(&entry.action));
+    push_hash_field(&mut input, "target_type", Some(&entry.target_type));
+    push_hash_field(&mut input, "target_id", entry.target_id.as_deref());
+    push_hash_field(&mut input, "before_json", entry.before_json.as_deref());
+    push_hash_field(&mut input, "after_json", entry.after_json.as_deref());
+    push_hash_field(&mut input, "metadata_json", entry.metadata_json.as_deref());
+    push_hash_field(&mut input, "created_at", Some(&created_at));
+    push_hash_field(&mut input, "prev_hash", entry.prev_hash.as_deref());
+    sha256_hex(input.as_bytes())
+}
+
+fn calculate_audit_digest_hash(date: Date, entry_hashes: &[String]) -> String {
+    let mut input = String::from("pasori-timecard:audit-digest:v1\n");
+    let date_string = date.to_string();
+    let entry_count = entry_hashes.len().to_string();
+    push_hash_field(&mut input, "date", Some(&date_string));
+    push_hash_field(&mut input, "entry_count", Some(&entry_count));
+    for entry_hash in entry_hashes {
+        push_hash_field(&mut input, "entry_hash", Some(entry_hash));
+    }
+    sha256_hex(input.as_bytes())
+}
+
+fn push_hash_field(input: &mut String, name: &str, value: Option<&str>) {
+    input.push_str(name);
+    input.push('=');
+    match value {
+        Some(value) => {
+            input.push_str(&value.len().to_string());
+            input.push(':');
+            input.push_str(value);
+        }
+        None => input.push_str("-1:"),
+    }
+    input.push('\n');
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn tokyo_start_of_day(date: Date) -> Result<Zoned, RepoError> {
+    date.at(0, 0, 0, 0)
+        .in_tz("Asia/Tokyo")
+        .map_err(|e| RepoError::Db(format!("invalid audit digest date: {e}")))
 }
 
 fn status_to_db_string(status: AttendanceRequestStatus) -> Result<String, RepoError> {
@@ -1218,6 +1436,8 @@ fn map_audit_log_row(row: sqlx::sqlite::SqliteRow) -> Result<AuditLog, RepoError
         after_json: row.get("after_json"),
         metadata_json: row.get("metadata_json"),
         created_at: parse_zoned(row.get("created_at"))?,
+        prev_hash: row.get("prev_hash"),
+        entry_hash: row.get("entry_hash"),
     })
 }
 

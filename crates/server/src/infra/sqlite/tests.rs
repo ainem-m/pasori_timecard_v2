@@ -564,3 +564,137 @@ async fn prevents_audit_log_delete() {
         "DELETE on audit_log should be prohibited by trigger"
     );
 }
+
+#[tokio::test]
+// audit_log 追記時に entry_hash と前行の prev_hash が保存される。
+async fn appends_audit_log_hash_chain_values() {
+    let pool = setup_db().await;
+    let repo = SqliteRepository::new(pool.clone());
+
+    repo.append(NewAuditLog {
+        actor_type: "system".to_string(),
+        actor_id: None,
+        action: "test.first".to_string(),
+        target_type: "test".to_string(),
+        target_id: None,
+        before_json: None,
+        after_json: Some(r#"{"value":1}"#.to_string()),
+        metadata_json: None,
+    })
+    .await
+    .expect("append first audit log");
+    repo.append(NewAuditLog {
+        actor_type: "system".to_string(),
+        actor_id: None,
+        action: "test.second".to_string(),
+        target_type: "test".to_string(),
+        target_id: None,
+        before_json: None,
+        after_json: Some(r#"{"value":2}"#.to_string()),
+        metadata_json: None,
+    })
+    .await
+    .expect("append second audit log");
+
+    let rows =
+        sqlx::query("SELECT prev_hash, entry_hash FROM audit_log ORDER BY created_at ASC, id ASC")
+            .fetch_all(&pool)
+            .await
+            .expect("select audit hashes");
+
+    let first_prev_hash = rows[0].get::<Option<String>, _>("prev_hash");
+    let first_entry_hash = rows[0].get::<String, _>("entry_hash");
+    let second_prev_hash = rows[1].get::<Option<String>, _>("prev_hash");
+    let second_entry_hash = rows[1].get::<String, _>("entry_hash");
+
+    assert_eq!(first_prev_hash, None);
+    assert_eq!(first_entry_hash.len(), 64);
+    assert_eq!(second_prev_hash, Some(first_entry_hash));
+    assert_eq!(second_entry_hash.len(), 64);
+}
+
+#[tokio::test]
+// audit_log の内容が DB ファイル上で改変された場合、hash chain 検証は不整合を返す。
+async fn detects_tampered_audit_log_hash_chain() {
+    let pool = setup_db().await;
+    let repo = SqliteRepository::new(pool.clone());
+
+    repo.append(NewAuditLog {
+        actor_type: "system".to_string(),
+        actor_id: None,
+        action: "test.action".to_string(),
+        target_type: "test".to_string(),
+        target_id: None,
+        before_json: None,
+        after_json: Some(r#"{"value":1}"#.to_string()),
+        metadata_json: None,
+    })
+    .await
+    .expect("append audit log");
+
+    sqlx::query("DROP TRIGGER prevent_audit_log_update")
+        .execute(&pool)
+        .await
+        .expect("drop update trigger to simulate direct db tampering");
+    sqlx::query("UPDATE audit_log SET after_json = ? WHERE action = 'test.action'")
+        .bind(r#"{"value":999}"#)
+        .execute(&pool)
+        .await
+        .expect("tamper audit log");
+
+    let verification = repo
+        .verify_audit_log_hash_chain()
+        .await
+        .expect("verify audit log chain");
+
+    assert!(!verification.is_valid);
+    assert_eq!(verification.checked_entries, 1);
+    assert_eq!(
+        verification.first_invalid_action.as_deref(),
+        Some("test.action")
+    );
+}
+
+#[tokio::test]
+// 日次 audit digest は対象日の entry_hash から検証用 digest を生成する。
+async fn calculates_daily_audit_digest() {
+    let pool = setup_db().await;
+    let repo = SqliteRepository::new(pool);
+    let digest_date = Zoned::now().date();
+
+    repo.append(NewAuditLog {
+        actor_type: "system".to_string(),
+        actor_id: None,
+        action: "test.first".to_string(),
+        target_type: "test".to_string(),
+        target_id: None,
+        before_json: None,
+        after_json: Some(r#"{"value":1}"#.to_string()),
+        metadata_json: None,
+    })
+    .await
+    .expect("append first audit log");
+    repo.append(NewAuditLog {
+        actor_type: "system".to_string(),
+        actor_id: None,
+        action: "test.second".to_string(),
+        target_type: "test".to_string(),
+        target_id: None,
+        before_json: None,
+        after_json: Some(r#"{"value":2}"#.to_string()),
+        metadata_json: None,
+    })
+    .await
+    .expect("append second audit log");
+
+    let digest = repo
+        .audit_digest_for_date(digest_date)
+        .await
+        .expect("calculate audit digest");
+
+    assert_eq!(digest.date, digest_date);
+    assert_eq!(digest.entry_count, 2);
+    assert_eq!(digest.digest_hash.len(), 64);
+    assert!(digest.first_entry_hash.is_some());
+    assert!(digest.last_entry_hash.is_some());
+}

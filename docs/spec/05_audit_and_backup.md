@@ -38,6 +38,8 @@
 | after_json | Option\<JSON\> |
 | metadata_json | Option\<JSON\> |
 | created_at | Zoned |
+| prev_hash | Option\<String\> |
+| entry_hash | Option\<String\> |
 
 ### 追加禁止事項
 
@@ -51,15 +53,52 @@
 - アプリケーション経由の打刻修正・申請承認/却下は、業務データ更新と `audit_log` 追記を同一 SQLite transaction で実行する
 - 監査ログ追記に失敗した場合、対応する打刻更新・打刻作成・申請状態変更は rollback する
 - `audit_log` 自体は append-only とし、SQLite trigger で update/delete を拒否する
-- OS 管理者権限で DB ファイルを直接置換・改変できる脅威への耐性は、この段階の保証範囲外とする
+- migration `20260429000000_audit_log_hash_chain.sql` 以降に作成された監査ログは hash chain 化する
+  - `prev_hash`: 直前の chain entry の `entry_hash`
+  - `entry_hash`: audit entry の canonical payload と `prev_hash` から算出した SHA-256 hex
+  - migration 前に存在する `prev_hash = NULL`, `entry_hash = NULL` の行は legacy entry として扱い、chain 検証対象外にする
+- chain 検証は、監査ログ本文・順序・`prev_hash` の不整合を検出する
+- 日次 audit digest は、対象日の `entry_hash` 列から SHA-256 hex として算出できる
+- OS 管理者権限で DB ファイルを直接置換・改変できる脅威に対しては、DB 内 chain だけでは完全防御しない。検知力を高めるには日次 digest を DB 外へ保存する必要がある
 
-### 次段階案: hash chain / 外部保全
+### hash chain
+
+hash input は `pasori-timecard:audit-log-entry:v1` を version marker とし、以下の値を順序固定・length-prefix 形式で連結する。
+
+- `id`
+- `actor_type`
+- `actor_id`
+- `action`
+- `target_type`
+- `target_id`
+- `before_json`
+- `after_json`
+- `metadata_json`
+- `created_at`
+- `prev_hash`
+
+### 日次 audit digest
+
+日次 digest は `pasori-timecard:audit-digest:v1` を version marker とし、以下の値を順序固定・length-prefix 形式で連結して SHA-256 hex を算出する。
+
+- 対象日 (`YYYY-MM-DD`)
+- 対象日の hash chain entry 数
+- 対象日の `entry_hash` 一覧 (`created_at ASC, id ASC`)
+
+digest には以下を含める。
+
+- `date`
+- `entry_count`
+- `first_entry_hash`
+- `last_entry_hash`
+- `digest_hash`
+
+### 次段階案: digest 外部保全
 
 次 PR 候補として以下を検討する。
 
-- `audit_log.prev_hash` と `audit_log.entry_hash` を追加し、監査ログを hash chain 化する
-- 日次で audit digest を出力する
-- digest を DB とは別媒体へ保存する、または LINE WORKS の管理者宛に通知する
+- 日次 digest を DB とは別媒体へ保存する
+- 日次 digest を LINE WORKS の管理者宛に通知する
 - 起動時・バックアップ時に chain 検証を行い、不整合を管理画面とログに表示する
 
 ## バックアップ
