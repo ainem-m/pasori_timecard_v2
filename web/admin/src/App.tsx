@@ -18,6 +18,7 @@ import {
   formatAttendanceRequest,
   formatAttendanceStatus,
   formatMinutes,
+  formatPolicyProfile,
   formatPunchEventLabel,
 } from './formatters';
 import type {
@@ -670,7 +671,7 @@ export default function App() {
               </div>
 
               {monthlyAttendance && (
-                <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
                   <div className="card p-5">
                     <p className="text-sm text-muted-foreground">対象期間</p>
                     <p className="mt-2 text-lg font-semibold">
@@ -682,8 +683,16 @@ export default function App() {
                     <p className="mt-2 text-lg font-semibold">{formatMinutes(monthlyAttendance.total_work_minutes)}</p>
                   </div>
                   <div className="card p-5">
-                    <p className="text-sm text-muted-foreground">勤怠日数</p>
-                    <p className="mt-2 text-lg font-semibold">{monthlyAttendance.days.length}日</p>
+                    <p className="text-sm text-muted-foreground">勤怠ポリシー</p>
+                    <p className="mt-2 text-lg font-semibold">{formatPolicyProfile(monthlyAttendance.policy_profile)}</p>
+                  </div>
+                  <div className="card p-5">
+                    <p className="text-sm text-muted-foreground">補助集計</p>
+                    <div className="mt-2 space-y-1 text-sm font-semibold">
+                      <p>残業 {formatMinutes(monthlyAttendance.derived_totals.fixed_time_extra_minutes)}</p>
+                      <p>8時間超 {formatMinutes(monthlyAttendance.derived_totals.over_8h_work_minutes)}</p>
+                      <p>出勤 {monthlyAttendance.derived_totals.work_days}日</p>
+                    </div>
                   </div>
                 </div>
               )}
@@ -695,13 +704,14 @@ export default function App() {
                       <th className="px-6 py-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">日付</th>
                       <th className="px-6 py-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">打刻</th>
                       <th className="px-6 py-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">勤務時間</th>
+                      <th className="px-6 py-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">補助集計</th>
                       <th className="px-6 py-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">状態</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-border">
                     {isAttendanceLoading && (
                       <tr>
-                        <td colSpan={4} className="px-6 py-8 text-center text-sm text-muted-foreground">
+                        <td colSpan={5} className="px-6 py-8 text-center text-sm text-muted-foreground">
                           月次勤怠を読み込んでいます...
                         </td>
                       </tr>
@@ -724,6 +734,24 @@ export default function App() {
                         <td className="px-6 py-4 text-sm font-semibold">
                           {formatMinutes(day.work_minutes)}
                         </td>
+                        <td className="px-6 py-4 text-sm text-muted-foreground">
+                          <div className="space-y-1">
+                            {day.derived.fixed_time_extra_minutes > 0 && (
+                              <div>残業 {formatMinutes(day.derived.fixed_time_extra_minutes)}</div>
+                            )}
+                            {day.derived.counted_work_minutes > 0 && day.derived.counted_work_minutes !== day.work_minutes && (
+                              <div>集計 {formatMinutes(day.derived.counted_work_minutes)}</div>
+                            )}
+                            {day.derived.reference_work_minutes > 0 && monthlyAttendance.policy_profile === 'legacy_doctor_2026' && (
+                              <div>参考 {formatMinutes(day.derived.reference_work_minutes)}</div>
+                            )}
+                            {day.derived.fixed_time_extra_minutes === 0 &&
+                              (day.derived.counted_work_minutes === 0 || day.derived.counted_work_minutes === day.work_minutes) &&
+                              !(day.derived.reference_work_minutes > 0 && monthlyAttendance.policy_profile === 'legacy_doctor_2026') && (
+                                <span>-</span>
+                              )}
+                          </div>
+                        </td>
                         <td className="px-6 py-4 text-sm">
                           <div className="flex items-center gap-2">
                             <span>{formatAttendanceStatus(day.status)}</span>
@@ -738,7 +766,7 @@ export default function App() {
                     ))}
                     {!isAttendanceLoading && monthlyAttendance && monthlyAttendance.days.length === 0 && (
                       <tr>
-                        <td colSpan={4} className="px-6 py-8 text-center text-sm text-muted-foreground">
+                        <td colSpan={5} className="px-6 py-8 text-center text-sm text-muted-foreground">
                           この期間の勤怠はありません。
                         </td>
                       </tr>

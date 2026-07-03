@@ -117,12 +117,33 @@ function mockAdminApi(overrides: Record<string, unknown> = {}, options: { unauth
         year_month: { year: 2026, month: 4 },
         period_start: '2026-03-16',
         period_end: '2026-04-15',
-        total_work_minutes: 1050,
+        total_work_minutes: 1170,
+        policy_profile: 'legacy_regular_2026',
+        derived_totals: {
+          counted_work_minutes: 1170,
+          fixed_time_extra_minutes: 60,
+          within_8h_work_minutes: 0,
+          over_8h_work_minutes: 0,
+          paid_leave_days: 0,
+          work_days: 2,
+          reference_work_minutes: 1170,
+          attendance_notes: [],
+        },
         cutoff_rule: { type: 'day_of_month', day: 15 },
         days: [
           {
             date: '2026-03-16',
             work_minutes: 540,
+            derived: {
+              counted_work_minutes: 540,
+              fixed_time_extra_minutes: 0,
+              within_8h_work_minutes: 0,
+              over_8h_work_minutes: 0,
+              paid_leave_days: 0,
+              work_days: 1,
+              reference_work_minutes: 540,
+              attendance_notes: [],
+            },
             has_inconsistency: false,
             status: 'confirmed',
             events: [
@@ -138,6 +159,38 @@ function mockAdminApi(overrides: Record<string, unknown> = {}, options: { unauth
                 employee_id: 'emp-1',
                 event_type: 'clock_out',
                 occurred_at: '2026-03-16T18:00:00+09:00',
+                source: 'nfc',
+              },
+            ],
+          },
+          {
+            date: '2026-04-15',
+            work_minutes: 630,
+            derived: {
+              counted_work_minutes: 630,
+              fixed_time_extra_minutes: 60,
+              within_8h_work_minutes: 0,
+              over_8h_work_minutes: 0,
+              paid_leave_days: 0,
+              work_days: 1,
+              reference_work_minutes: 630,
+              attendance_notes: [],
+            },
+            has_inconsistency: false,
+            status: 'confirmed',
+            events: [
+              {
+                id: 'p3',
+                employee_id: 'emp-1',
+                event_type: 'clock_in',
+                occurred_at: '2026-04-15T09:30:00+09:00',
+                source: 'nfc',
+              },
+              {
+                id: 'p4',
+                employee_id: 'emp-1',
+                event_type: 'clock_out',
+                occurred_at: '2026-04-15T20:00:00+09:00',
                 source: 'nfc',
               },
             ],
@@ -269,5 +322,17 @@ describe('Admin App', () => {
 
     expect(auditRow).not.toBeNull()
     expect(within(auditRow as HTMLTableRowElement).getByText('employee:emp-1')).toBeInTheDocument()
+  })
+
+  it('月次勤怠に policy profile と補助集計を表示する', async () => {
+    mockAdminApi()
+
+    render(<App />)
+
+    fireEvent.click(await screen.findByRole('button', { name: '勤怠' }))
+
+    expect(await screen.findByText('正社員')).toBeInTheDocument()
+    expect(screen.getAllByText('残業 1時間 0分').length).toBeGreaterThan(0)
+    expect(screen.getByText('2026-04-15')).toBeInTheDocument()
   })
 })
