@@ -1,6 +1,6 @@
-use crate::port::policy::{PunchEventType, RoundingPolicy};
+use crate::port::policy::{NoRounding, PunchEventType, RoundingPolicy};
 use jiff::Zoned;
-use jiff::civil::Date;
+use jiff::civil::{Date, Weekday};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -60,11 +60,89 @@ pub enum AttendanceDayStatus {
     Locked,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyProfile {
+    #[serde(rename = "legacy_regular_2026")]
+    LegacyRegular2026,
+    #[serde(rename = "legacy_part_time_2026")]
+    LegacyPartTime2026,
+    #[serde(rename = "legacy_doctor_2026")]
+    LegacyDoctor2026,
+}
+
+impl PolicyProfile {
+    pub fn from_employment_type(employment_type: &str) -> Self {
+        match employment_type {
+            "part_time" => Self::LegacyPartTime2026,
+            "doctor" => Self::LegacyDoctor2026,
+            _ => Self::LegacyRegular2026,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DerivedAttendance {
+    pub counted_work_minutes: i64,
+    pub fixed_time_extra_minutes: i64,
+    pub within_8h_work_minutes: i64,
+    pub over_8h_work_minutes: i64,
+    pub paid_leave_days: f64,
+    pub work_days: i64,
+    pub reference_work_minutes: i64,
+    pub attendance_notes: Vec<String>,
+}
+
+impl Default for DerivedAttendance {
+    fn default() -> Self {
+        Self {
+            counted_work_minutes: 0,
+            fixed_time_extra_minutes: 0,
+            within_8h_work_minutes: 0,
+            over_8h_work_minutes: 0,
+            paid_leave_days: 0.0,
+            work_days: 0,
+            reference_work_minutes: 0,
+            attendance_notes: Vec::new(),
+        }
+    }
+}
+
+impl DerivedAttendance {
+    pub fn for_day(profile: PolicyProfile, day: &AttendanceDay) -> Self {
+        match profile {
+            PolicyProfile::LegacyRegular2026 => regular_derived(day),
+            PolicyProfile::LegacyPartTime2026 => part_time_derived(day),
+            PolicyProfile::LegacyDoctor2026 => doctor_derived(day),
+        }
+    }
+
+    pub fn sum_days(days: &[AttendanceDay]) -> Self {
+        let mut total = Self::default();
+
+        for day in days {
+            total.counted_work_minutes += day.derived.counted_work_minutes;
+            total.fixed_time_extra_minutes += day.derived.fixed_time_extra_minutes;
+            total.within_8h_work_minutes += day.derived.within_8h_work_minutes;
+            total.over_8h_work_minutes += day.derived.over_8h_work_minutes;
+            total.paid_leave_days += day.derived.paid_leave_days;
+            total.work_days += day.derived.work_days;
+            total.reference_work_minutes += day.derived.reference_work_minutes;
+            total
+                .attendance_notes
+                .extend(day.derived.attendance_notes.iter().cloned());
+        }
+
+        total
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AttendanceDay {
     pub date: Date,
     pub events: Vec<PunchEvent>,
     pub work_minutes: i64,
+    pub derived: DerivedAttendance,
     pub has_inconsistency: bool,
     pub status: AttendanceDayStatus,
 }
@@ -74,7 +152,7 @@ impl AttendanceDay {
         date: Date,
         mut events: Vec<PunchEvent>,
         status: AttendanceDayStatus,
-        rounding_policy: &dyn RoundingPolicy,
+        _rounding_policy: &dyn RoundingPolicy,
     ) -> Self {
         events.sort_by_key(|event| event.occurred_at.timestamp().as_second());
 
@@ -90,16 +168,12 @@ impl AttendanceDay {
                         has_inconsistency = true;
                     }
 
-                    open_clock_in =
-                        Some(rounding_policy.round(event.event_type, &event.occurred_at));
+                    open_clock_in = Some(event.occurred_at.clone());
                 }
                 PunchEventType::ClockOut => {
-                    let rounded_clock_out =
-                        rounding_policy.round(event.event_type, &event.occurred_at);
-
                     if let Some(clock_in) = open_clock_in.take() {
                         let duration_minutes =
-                            calculate_duration_minutes(&clock_in, &rounded_clock_out);
+                            calculate_duration_minutes(&clock_in, &event.occurred_at);
                         pair_count += 1;
 
                         if duration_minutes < 0 {
@@ -132,9 +206,21 @@ impl AttendanceDay {
             date,
             events,
             work_minutes,
+            derived: DerivedAttendance::default(),
             has_inconsistency,
             status,
         }
+    }
+
+    pub fn from_events_with_policy_profile(
+        date: Date,
+        events: Vec<PunchEvent>,
+        status: AttendanceDayStatus,
+        policy_profile: PolicyProfile,
+    ) -> Self {
+        let mut day = Self::from_events(date, events, status, &NoRounding);
+        day.derived = DerivedAttendance::for_day(policy_profile, &day);
+        day
     }
 }
 
@@ -142,10 +228,126 @@ fn calculate_duration_minutes(start: &Zoned, end: &Zoned) -> i64 {
     (end.timestamp().as_second() - start.timestamp().as_second()) / 60
 }
 
+fn regular_derived(day: &AttendanceDay) -> DerivedAttendance {
+    let mut derived = DerivedAttendance {
+        counted_work_minutes: day.work_minutes,
+        work_days: i64::from(day.work_minutes > 0),
+        reference_work_minutes: day.work_minutes,
+        ..DerivedAttendance::default()
+    };
+
+    if matches!(day.date.weekday(), Weekday::Saturday | Weekday::Sunday) {
+        return derived;
+    }
+
+    let Some(threshold) = tokyo_datetime_for_date(day.date, 19, 0) else {
+        return derived;
+    };
+    derived.fixed_time_extra_minutes = valid_work_pairs(&day.events)
+        .into_iter()
+        .map(|(clock_in, clock_out)| minutes_after_threshold(&clock_in, &clock_out, &threshold))
+        .sum();
+
+    derived
+}
+
+fn part_time_derived(day: &AttendanceDay) -> DerivedAttendance {
+    let counted_work_minutes: i64 = valid_work_pairs(&day.events)
+        .into_iter()
+        .map(|(clock_in, clock_out)| {
+            let rounded_clock_in = round_clock_in_to_next_30_minutes(&clock_in);
+            calculate_duration_minutes(&rounded_clock_in, &clock_out).max(0)
+        })
+        .sum();
+
+    DerivedAttendance {
+        counted_work_minutes,
+        within_8h_work_minutes: counted_work_minutes.min(8 * 60),
+        over_8h_work_minutes: (counted_work_minutes - 8 * 60).max(0),
+        work_days: i64::from(counted_work_minutes > 0),
+        reference_work_minutes: day.work_minutes,
+        ..DerivedAttendance::default()
+    }
+}
+
+fn doctor_derived(day: &AttendanceDay) -> DerivedAttendance {
+    DerivedAttendance {
+        work_days: i64::from(day.work_minutes > 0),
+        reference_work_minutes: day.work_minutes,
+        ..DerivedAttendance::default()
+    }
+}
+
+fn valid_work_pairs(events: &[PunchEvent]) -> Vec<(Zoned, Zoned)> {
+    let mut pairs = Vec::new();
+    let mut open_clock_in: Option<Zoned> = None;
+
+    for event in events {
+        match event.event_type {
+            PunchEventType::ClockIn => {
+                open_clock_in = Some(event.occurred_at.clone());
+            }
+            PunchEventType::ClockOut => {
+                if let Some(clock_in) = open_clock_in.take()
+                    && calculate_duration_minutes(&clock_in, &event.occurred_at) >= 0
+                {
+                    pairs.push((clock_in, event.occurred_at.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pairs
+}
+
+fn minutes_after_threshold(clock_in: &Zoned, clock_out: &Zoned, threshold: &Zoned) -> i64 {
+    let start_second = clock_in
+        .timestamp()
+        .as_second()
+        .max(threshold.timestamp().as_second());
+    let end_second = clock_out.timestamp().as_second();
+
+    if end_second <= start_second {
+        return 0;
+    }
+
+    (end_second - start_second) / 60
+}
+
+fn round_clock_in_to_next_30_minutes(at: &Zoned) -> Zoned {
+    let datetime = at.datetime();
+    let total_minutes = i64::from(datetime.hour()) * 60 + i64::from(datetime.minute());
+    let rounded_total_minutes = ((total_minutes + 29) / 30) * 30;
+    let mut rounded_date = at.date();
+    let mut minute_of_day = rounded_total_minutes;
+
+    if minute_of_day >= 24 * 60 {
+        let Ok(next_date) = rounded_date.tomorrow() else {
+            return at.clone();
+        };
+        rounded_date = next_date;
+        minute_of_day -= 24 * 60;
+    }
+
+    let Ok(hour) = i8::try_from(minute_of_day / 60) else {
+        return at.clone();
+    };
+    let Ok(minute) = i8::try_from(minute_of_day % 60) else {
+        return at.clone();
+    };
+
+    tokyo_datetime_for_date(rounded_date, hour, minute).unwrap_or_else(|| at.clone())
+}
+
+fn tokyo_datetime_for_date(date: Date, hour: i8, minute: i8) -> Option<Zoned> {
+    date.at(hour, minute, 0, 0).in_tz("Asia/Tokyo").ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AttendanceDay, AttendanceDayStatus, PunchEvent};
-    use crate::port::policy::{NoRounding, PunchEventType};
+    use super::{AttendanceDay, AttendanceDayStatus, PolicyProfile, PunchEvent};
+    use crate::port::policy::{NoRounding, PunchEventType, RoundingPolicy};
     use jiff::{Zoned, civil::date};
     use proptest::prelude::*;
     use uuid::Uuid;
@@ -249,6 +451,98 @@ mod tests {
 
         assert_eq!(day.work_minutes, 540);
         assert!(!day.has_inconsistency);
+    }
+
+    #[test]
+    // raw 勤務分数は policy 丸めで変更されない。
+    fn keeps_raw_work_minutes_when_rounding_policy_would_change_clock_in() {
+        let day = AttendanceDay::from_events(
+            date(2026, 4, 16),
+            vec![
+                punch_event(PunchEventType::ClockIn, 2026, 4, 16, 9, 1),
+                punch_event(PunchEventType::ClockOut, 2026, 4, 16, 18, 0),
+            ],
+            AttendanceDayStatus::Confirmed,
+            &CeilClockInToHalfHour,
+        );
+
+        assert_eq!(day.work_minutes, 539);
+        assert_eq!(day.events[0].occurred_at, tokyo_datetime(2026, 4, 16, 9, 1));
+    }
+
+    #[test]
+    // 雇用区分は MVP preset の既定 policy profile に対応する。
+    fn maps_employment_type_to_default_policy_profile() {
+        assert_eq!(
+            PolicyProfile::from_employment_type("regular"),
+            PolicyProfile::LegacyRegular2026
+        );
+        assert_eq!(
+            PolicyProfile::from_employment_type("part_time"),
+            PolicyProfile::LegacyPartTime2026
+        );
+        assert_eq!(
+            PolicyProfile::from_employment_type("doctor"),
+            PolicyProfile::LegacyDoctor2026
+        );
+        assert_eq!(
+            PolicyProfile::from_employment_type("unknown"),
+            PolicyProfile::LegacyRegular2026
+        );
+    }
+
+    #[test]
+    // 正社員 preset は平日 19:00 以降の勤務だけを fixed_time_extra に集計する。
+    fn derives_regular_fixed_time_extra_after_19_on_weekdays() {
+        let day = AttendanceDay::from_events_with_policy_profile(
+            date(2026, 4, 20),
+            vec![
+                punch_event(PunchEventType::ClockIn, 2026, 4, 20, 18, 30),
+                punch_event(PunchEventType::ClockOut, 2026, 4, 20, 20, 0),
+            ],
+            AttendanceDayStatus::Confirmed,
+            PolicyProfile::LegacyRegular2026,
+        );
+
+        assert_eq!(day.work_minutes, 90);
+        assert_eq!(day.derived.fixed_time_extra_minutes, 60);
+    }
+
+    #[test]
+    // パート preset は出勤だけを 30 分切り上げ、8 時間以内と 8 時間超に分ける。
+    fn derives_part_time_rounded_counted_minutes_and_over_8h() {
+        let day = AttendanceDay::from_events_with_policy_profile(
+            date(2026, 4, 16),
+            vec![
+                punch_event(PunchEventType::ClockIn, 2026, 4, 16, 8, 46),
+                punch_event(PunchEventType::ClockOut, 2026, 4, 16, 18, 0),
+            ],
+            AttendanceDayStatus::Confirmed,
+            PolicyProfile::LegacyPartTime2026,
+        );
+
+        assert_eq!(day.work_minutes, 554);
+        assert_eq!(day.derived.counted_work_minutes, 540);
+        assert_eq!(day.derived.within_8h_work_minutes, 480);
+        assert_eq!(day.derived.over_8h_work_minutes, 60);
+    }
+
+    #[test]
+    // ドクター preset は出勤日数を主集計し、勤務時間は参考値に留める。
+    fn derives_doctor_work_days_and_reference_minutes() {
+        let day = AttendanceDay::from_events_with_policy_profile(
+            date(2026, 4, 16),
+            vec![
+                punch_event(PunchEventType::ClockIn, 2026, 4, 16, 9, 0),
+                punch_event(PunchEventType::ClockOut, 2026, 4, 16, 18, 0),
+            ],
+            AttendanceDayStatus::Confirmed,
+            PolicyProfile::LegacyDoctor2026,
+        );
+
+        assert_eq!(day.derived.work_days, 1);
+        assert_eq!(day.derived.reference_work_minutes, 540);
+        assert_eq!(day.derived.fixed_time_extra_minutes, 0);
     }
 
     proptest! {
@@ -384,5 +678,29 @@ mod tests {
             .at(hour, minute, 0, 0)
             .in_tz("Asia/Tokyo")
             .expect("Asia/Tokyo datetime should be valid")
+    }
+
+    struct CeilClockInToHalfHour;
+
+    impl RoundingPolicy for CeilClockInToHalfHour {
+        fn round(&self, event_type: PunchEventType, at: &Zoned) -> Zoned {
+            if event_type != PunchEventType::ClockIn {
+                return at.clone();
+            }
+
+            let datetime = at.datetime();
+            let total_minutes = i64::from(datetime.hour()) * 60 + i64::from(datetime.minute());
+            let rounded_total_minutes = ((total_minutes + 29) / 30) * 30;
+            let rounded_hour = i8::try_from(rounded_total_minutes / 60).expect("valid hour");
+            let rounded_minute = i8::try_from(rounded_total_minutes % 60).expect("valid minute");
+
+            tokyo_datetime(
+                at.date().year(),
+                at.date().month(),
+                at.date().day(),
+                rounded_hour,
+                rounded_minute,
+            )
+        }
     }
 }

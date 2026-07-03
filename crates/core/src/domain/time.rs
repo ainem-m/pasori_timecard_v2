@@ -1,4 +1,4 @@
-use crate::domain::punch::AttendanceDay;
+use crate::domain::punch::{AttendanceDay, DerivedAttendance, PolicyProfile};
 use jiff::civil::Date;
 use thiserror::Error;
 use uuid::Uuid;
@@ -119,9 +119,11 @@ pub struct MonthlyTimesheet {
     pub year_month: YearMonth,
     pub days: Vec<AttendanceDay>,
     pub total_work_minutes: i64,
+    pub derived_totals: DerivedAttendance,
     pub cutoff_rule: CutoffRule,
     pub period_start: Date,
     pub period_end: Date,
+    pub policy_profile: PolicyProfile,
 }
 
 impl MonthlyTimesheet {
@@ -130,6 +132,22 @@ impl MonthlyTimesheet {
         year_month: YearMonth,
         cutoff_rule: CutoffRule,
         days: Vec<AttendanceDay>,
+    ) -> Result<Self, TimeDomainError> {
+        Self::from_days_with_policy_profile(
+            employee_id,
+            year_month,
+            cutoff_rule,
+            days,
+            PolicyProfile::LegacyRegular2026,
+        )
+    }
+
+    pub fn from_days_with_policy_profile(
+        employee_id: Uuid,
+        year_month: YearMonth,
+        cutoff_rule: CutoffRule,
+        days: Vec<AttendanceDay>,
+        policy_profile: PolicyProfile,
     ) -> Result<Self, TimeDomainError> {
         let period = year_month.attendance_period(cutoff_rule)?;
 
@@ -146,15 +164,18 @@ impl MonthlyTimesheet {
         }
 
         let total_work_minutes = days.iter().map(|day| day.work_minutes).sum();
+        let derived_totals = DerivedAttendance::sum_days(&days);
 
         Ok(Self {
             employee_id,
             year_month,
             days,
             total_work_minutes,
+            derived_totals,
             cutoff_rule,
             period_start: period.period_start,
             period_end: period.period_end,
+            policy_profile,
         })
     }
 }
@@ -183,7 +204,7 @@ mod tests {
     use super::{
         AttendanceDay, CutoffDay, CutoffRule, MonthlyTimesheet, TimeDomainError, YearMonth,
     };
-    use crate::domain::punch::AttendanceDayStatus;
+    use crate::domain::punch::{AttendanceDayStatus, DerivedAttendance, PolicyProfile};
     use jiff::civil::{Date, date};
     use proptest::prelude::*;
     use uuid::Uuid;
@@ -295,6 +316,34 @@ mod tests {
             .expect_err("day outside period should be rejected");
 
         assert!(matches!(error, TimeDomainError::DayOutOfRange { .. }));
+    }
+
+    #[test]
+    // 月次勤怠表は日次 derived value を policy profile ごとに合算する。
+    fn sums_daily_derived_values_into_monthly_timesheet() {
+        let employee_id = Uuid::now_v7();
+        let year_month = YearMonth::new(2026, 4).expect("valid year_month");
+        let cutoff_rule = CutoffRule::DayOfMonth(CutoffDay::new(15).expect("valid cutoff day"));
+        let days = vec![
+            attendance_day_with_derived(date(2026, 3, 16), 540, 30, 480, 30, 0.0, 1),
+            attendance_day_with_derived(date(2026, 4, 2), 600, 60, 480, 120, 0.0, 1),
+        ];
+
+        let timesheet = MonthlyTimesheet::from_days_with_policy_profile(
+            employee_id,
+            year_month,
+            cutoff_rule,
+            days,
+            PolicyProfile::LegacyPartTime2026,
+        )
+        .expect("monthly timesheet should be calculated");
+
+        assert_eq!(timesheet.policy_profile, PolicyProfile::LegacyPartTime2026);
+        assert_eq!(timesheet.derived_totals.counted_work_minutes, 1140);
+        assert_eq!(timesheet.derived_totals.fixed_time_extra_minutes, 90);
+        assert_eq!(timesheet.derived_totals.within_8h_work_minutes, 960);
+        assert_eq!(timesheet.derived_totals.over_8h_work_minutes, 150);
+        assert_eq!(timesheet.derived_totals.work_days, 2);
     }
 
     proptest! {
@@ -433,8 +482,28 @@ mod tests {
             date,
             events: vec![],
             work_minutes,
+            derived: DerivedAttendance::default(),
             has_inconsistency: false,
             status: AttendanceDayStatus::Confirmed,
         }
+    }
+
+    fn attendance_day_with_derived(
+        date: Date,
+        work_minutes: i64,
+        fixed_time_extra_minutes: i64,
+        within_8h_work_minutes: i64,
+        over_8h_work_minutes: i64,
+        paid_leave_days: f64,
+        work_days: i64,
+    ) -> AttendanceDay {
+        let mut day = attendance_day(date, work_minutes);
+        day.derived.counted_work_minutes = work_minutes;
+        day.derived.fixed_time_extra_minutes = fixed_time_extra_minutes;
+        day.derived.within_8h_work_minutes = within_8h_work_minutes;
+        day.derived.over_8h_work_minutes = over_8h_work_minutes;
+        day.derived.paid_leave_days = paid_leave_days;
+        day.derived.work_days = work_days;
+        day
     }
 }
