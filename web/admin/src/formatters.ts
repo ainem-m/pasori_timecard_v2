@@ -1,6 +1,6 @@
 import { format } from 'date-fns';
 
-import type { AttendanceDay, AttendanceRequest, PunchEvent } from './types';
+import type { AttendanceDay, AttendanceRequest, MonthlyAttendance, PunchEvent } from './types';
 
 export function formatPunchEventLabel(eventType: PunchEvent['event_type']) {
   switch (eventType) {
@@ -39,6 +39,17 @@ export function formatAttendanceStatus(status: AttendanceDay['status']) {
       return '確認済み';
     case 'locked':
       return '締め済み';
+  }
+}
+
+export function formatPolicyProfile(policyProfile: MonthlyAttendance['policy_profile']) {
+  switch (policyProfile) {
+    case 'legacy_regular_2026':
+      return '正社員';
+    case 'legacy_part_time_2026':
+      return 'パート';
+    case 'legacy_doctor_2026':
+      return 'ドクター';
   }
 }
 

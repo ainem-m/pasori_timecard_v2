@@ -23,6 +23,17 @@ export interface PunchEvent {
   source: string;
 }
 
+export interface DerivedAttendance {
+  counted_work_minutes: number;
+  fixed_time_extra_minutes: number;
+  within_8h_work_minutes: number;
+  over_8h_work_minutes: number;
+  paid_leave_days: number;
+  work_days: number;
+  reference_work_minutes: number;
+  attendance_notes: string[];
+}
+
 export interface AuditLog {
   id: string;
   actor_type: string;
@@ -41,6 +52,7 @@ export interface AttendanceDay {
   date: string;
   events: PunchEvent[];
   work_minutes: number;
+  derived: DerivedAttendance;
   has_inconsistency: boolean;
   status: 'unconfirmed' | 'confirmed' | 'locked';
 }
@@ -53,6 +65,7 @@ export interface MonthlyAttendance {
   };
   days: AttendanceDay[];
   total_work_minutes: number;
+  derived_totals: DerivedAttendance;
   cutoff_rule:
     | {
         type: 'day_of_month';
@@ -63,6 +76,7 @@ export interface MonthlyAttendance {
       };
   period_start: string;
   period_end: string;
+  policy_profile: 'legacy_regular_2026' | 'legacy_part_time_2026' | 'legacy_doctor_2026';
 }
 
 export interface EmployeeFormState {
