@@ -15,6 +15,7 @@ use pasori_core::port::reader::CardId;
 use pasori_core::port::repo::{CardRepository, EmployeeRepository, RepoError};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use uuid::{Uuid, Version};
 
 #[derive(Clone)]
 pub struct TerminalAppState {
@@ -183,48 +184,13 @@ async fn bind_card(
     ))
 }
 
-#[derive(Deserialize)]
-struct SubmitPunchRequest {
-    punch_id: uuid::Uuid,
-    employee_id: uuid::Uuid,
-    card_id: Option<uuid::Uuid>,
-    event_type: PunchEventType,
-    occurred_at: jiff::Zoned,
-    source: String,
-}
-
-async fn submit_punch(
-    headers: HeaderMap,
-    State(state): State<TerminalAppState>,
-    Json(payload): Json<SubmitPunchRequest>,
-) -> impl IntoResponse {
-    let _terminal = match authenticate_terminal_request(&state, &headers).await {
-        Ok(terminal) => terminal,
-        Err(status) => return Err(status),
-    };
-    let employee = match EmployeeRepository::find(&*state.repo, payload.employee_id).await {
-        Ok(Some(employee)) if employee.is_active => employee,
-        Ok(_) => return Err(StatusCode::NOT_FOUND),
-        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
-    };
-    let event = NewPunchEvent {
-        id: payload.punch_id,
-        employee_id: employee.id,
-        card_id: payload.card_id,
-        event_type: payload.event_type,
-        occurred_at: payload.occurred_at,
-        source: payload.source,
-    };
-
-    match state.punch_use_case.submit_punch(event).await {
-        Ok(punch) => Ok((StatusCode::CREATED, Json(punch))),
-        Err(error) => handle_submit_error(&state, payload.punch_id, error).await,
-    }
+async fn submit_punch() -> StatusCode {
+    StatusCode::GONE
 }
 
 #[derive(Deserialize)]
 pub struct TerminalSubmitPunchRequest {
-    pub punch_id: uuid::Uuid,
+    pub punch_id: Uuid,
     pub card_id: String,
     pub event_type: PunchEventType,
     pub occurred_at: jiff::Zoned,
@@ -240,10 +206,14 @@ async fn sync_punch(
         Ok(terminal) => terminal,
         Err(status) => return Err(status),
     };
-    let now = jiff::Zoned::now();
+    if !is_uuid_v7(payload.punch_id) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let source = PunchSource::parse(&payload.source)?;
+    let now = tokyo_now().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let occurred_at = resolve_occurred_at(source, &payload.occurred_at, &now)?;
     let card_id = CardId(payload.card_id);
 
-    // Resolve card first
     match state.punch_use_case.resolve_card_scan(&card_id, &now).await {
         Ok(ResolvedCardScan::Registered(scan)) => {
             let event = NewPunchEvent {
@@ -251,8 +221,8 @@ async fn sync_punch(
                 employee_id: scan.employee.id,
                 card_id: scan.card_id,
                 event_type: payload.event_type,
-                occurred_at: payload.occurred_at,
-                source: payload.source,
+                occurred_at,
+                source: source.as_str().to_string(),
             };
             match state.punch_use_case.submit_punch(event).await {
                 Ok(punch) => Ok((StatusCode::CREATED, Json(punch))),
@@ -261,6 +231,75 @@ async fn sync_punch(
         }
         _ => Err(StatusCode::NOT_FOUND),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PunchSource {
+    Nfc,
+    LocalCached,
+}
+
+impl PunchSource {
+    fn parse(value: &str) -> Result<Self, StatusCode> {
+        match value {
+            "nfc" => Ok(Self::Nfc),
+            "local_cached" => Ok(Self::LocalCached),
+            _ => Err(StatusCode::BAD_REQUEST),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Nfc => "nfc",
+            Self::LocalCached => "local_cached",
+        }
+    }
+}
+
+fn is_uuid_v7(id: Uuid) -> bool {
+    id.get_version() == Some(Version::SortRand)
+}
+
+fn tokyo_now() -> Result<jiff::Zoned, jiff::Error> {
+    Ok(jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::get("Asia/Tokyo")?))
+}
+
+fn resolve_occurred_at(
+    source: PunchSource,
+    requested_at: &jiff::Zoned,
+    server_now: &jiff::Zoned,
+) -> Result<jiff::Zoned, StatusCode> {
+    match source {
+        PunchSource::Nfc => truncate_to_minute(server_now),
+        PunchSource::LocalCached => {
+            let max_allowed = server_now
+                .clone()
+                .checked_add(jiff::SignedDuration::from_secs(10))
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            if requested_at.timestamp() > max_allowed.timestamp() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            Ok(requested_at.clone())
+        }
+    }
+}
+
+fn truncate_to_minute(zoned: &jiff::Zoned) -> Result<jiff::Zoned, StatusCode> {
+    let dt = zoned.datetime();
+    let truncated = jiff::civil::DateTime::new(
+        dt.year(),
+        dt.month(),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        0,
+        0,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    truncated
+        .in_tz("Asia/Tokyo")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn handle_submit_error(
@@ -325,7 +364,7 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::router;
+    use super::{router, tokyo_now, truncate_to_minute};
     use crate::infra::{console_notify::ConsoleNotifier, sqlite::SqliteRepository};
     use argon2::{
         Argon2,
@@ -517,8 +556,8 @@ mod tests {
     }
 
     #[tokio::test]
-    // 旧 punch API でも無効従業員への打刻は拒否する。
-    async fn rejects_legacy_punch_for_inactive_employee() {
+    // 旧 punch API は安全側に無効化する。
+    async fn rejects_legacy_punch_api_as_gone() {
         let (app, pool) = test_app("terminal-secret").await;
         sqlx::query("UPDATE employee SET is_active = 0 WHERE id = ?")
             .bind("0196273c-8b3e-7b92-92a7-d0ddf4828a10")
@@ -547,7 +586,7 @@ mod tests {
             .await
             .expect("response");
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::GONE);
     }
 
     #[tokio::test]
@@ -613,14 +652,15 @@ mod tests {
     }
 
     #[tokio::test]
-    // オフライン再送された打刻は source=local_cached のまま保存される。
-    async fn preserves_local_cached_source_for_synced_punch() {
+    // オフライン再送された過去打刻は source=local_cached と occurred_at をそのまま保存する。
+    async fn preserves_local_cached_source_and_occurred_at_for_synced_punch() {
         let (app, pool) = test_app("terminal-secret").await;
+        let occurred_at = "2026-04-17T09:00:00+09:00[Asia/Tokyo]";
         let body = serde_json::json!({
             "punch_id": Uuid::now_v7(),
             "card_id": TEST_CARD_ID,
             "event_type": "clock_in",
-            "occurred_at": "2026-04-17T09:00:00+09:00[Asia/Tokyo]",
+            "occurred_at": occurred_at,
             "source": "local_cached"
         });
 
@@ -640,12 +680,157 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::CREATED);
 
-        let row = sqlx::query("SELECT source FROM punch_event ORDER BY created_at DESC LIMIT 1")
+        let row = sqlx::query(
+            "SELECT source, occurred_at FROM punch_event ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("stored punch");
+
+        assert_eq!(row.get::<String, _>("source"), "local_cached");
+        assert_eq!(row.get::<String, _>("occurred_at"), occurred_at);
+    }
+
+    #[tokio::test]
+    // Terminal 打刻 API は未知の source を拒否する。
+    async fn rejects_unknown_punch_source() {
+        let (app, _pool) = test_app("terminal-secret").await;
+        let body = serde_json::json!({
+            "punch_id": Uuid::now_v7(),
+            "card_id": TEST_CARD_ID,
+            "event_type": "clock_in",
+            "occurred_at": "2026-04-17T09:00:00+09:00[Asia/Tokyo]",
+            "source": "manual"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/terminals/me/punches")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer terminal-secret")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    // オンライン打刻はリクエストの occurred_at ではなく Server 時刻で保存する。
+    async fn uses_server_time_for_nfc_punch() {
+        let (app, pool) = test_app("terminal-secret").await;
+        let punch_id = Uuid::now_v7();
+        let before_request = tokyo_now().expect("Tokyo now before request");
+        let body = serde_json::json!({
+            "punch_id": punch_id,
+            "card_id": TEST_CARD_ID,
+            "event_type": "clock_in",
+            "occurred_at": "2020-01-01T00:00:00+09:00[Asia/Tokyo]",
+            "source": "nfc"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/terminals/me/punches")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer terminal-secret")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let after_response = tokyo_now().expect("Tokyo now after response");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let row = sqlx::query("SELECT occurred_at FROM punch_event WHERE id = ?")
+            .bind(punch_id.to_string())
             .fetch_one(&pool)
             .await
             .expect("stored punch");
+        let occurred_at = row.get::<String, _>("occurred_at");
+        let stored_at = occurred_at.parse::<jiff::Zoned>().expect("stored zoned");
+        let earliest = truncate_to_minute(&before_request).expect("earliest minute");
+        let latest = truncate_to_minute(&after_response).expect("latest minute");
 
-        assert_eq!(row.get::<String, _>("source"), "local_cached");
+        assert_ne!(occurred_at, "2020-01-01T00:00:00+09:00[Asia/Tokyo]");
+        assert_eq!(stored_at.second(), 0);
+        assert_eq!(stored_at.subsec_nanosecond(), 0);
+        assert!(
+            stored_at.timestamp() >= earliest.timestamp(),
+            "stored_at={stored_at} earliest={earliest}"
+        );
+        assert!(
+            stored_at.timestamp() <= latest.timestamp(),
+            "stored_at={stored_at} latest={latest}"
+        );
+    }
+
+    #[tokio::test]
+    // オフライン再送は Server 時刻 +10 秒を超える未来 occurred_at を拒否する。
+    async fn rejects_local_cached_punch_from_future() {
+        let (app, _pool) = test_app("terminal-secret").await;
+        let future_occurred_at = tokyo_now()
+            .expect("Tokyo now")
+            .checked_add(jiff::SignedDuration::from_secs(60))
+            .expect("future occurred_at")
+            .to_string();
+        let body = serde_json::json!({
+            "punch_id": Uuid::now_v7(),
+            "card_id": TEST_CARD_ID,
+            "event_type": "clock_in",
+            "occurred_at": future_occurred_at,
+            "source": "local_cached"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/terminals/me/punches")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer terminal-secret")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    // Terminal 打刻 API は UUID v7 ではない punch_id を拒否する。
+    async fn rejects_non_uuid_v7_punch_id() {
+        let (app, _pool) = test_app("terminal-secret").await;
+        let body = serde_json::json!({
+            "punch_id": Uuid::nil(),
+            "card_id": TEST_CARD_ID,
+            "event_type": "clock_in",
+            "occurred_at": "2026-04-17T09:00:00+09:00[Asia/Tokyo]",
+            "source": "local_cached"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/terminals/me/punches")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer terminal-secret")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

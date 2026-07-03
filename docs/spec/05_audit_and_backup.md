@@ -46,6 +46,22 @@
 - 管理画面からも削除 UI は提供しない
 - ログの手動編集はファイル監視で警告 (v1.1 検討)
 
+### 改ざん耐性の現保証範囲
+
+- アプリケーション経由の打刻修正・申請承認/却下は、業務データ更新と `audit_log` 追記を同一 SQLite transaction で実行する
+- 監査ログ追記に失敗した場合、対応する打刻更新・打刻作成・申請状態変更は rollback する
+- `audit_log` 自体は append-only とし、SQLite trigger で update/delete を拒否する
+- OS 管理者権限で DB ファイルを直接置換・改変できる脅威への耐性は、この段階の保証範囲外とする
+
+### 次段階案: hash chain / 外部保全
+
+次 PR 候補として以下を検討する。
+
+- `audit_log.prev_hash` と `audit_log.entry_hash` を追加し、監査ログを hash chain 化する
+- 日次で audit digest を出力する
+- digest を DB とは別媒体へ保存する、または LINE WORKS の管理者宛に通知する
+- 起動時・バックアップ時に chain 検証を行い、不整合を管理画面とログに表示する
+
 ## バックアップ
 
 ### 日次自動バックアップ

@@ -1,4 +1,6 @@
-use crate::infra::sqlite::{AdminAuthenticationResult, AuthenticatedAdmin, SqliteRepository};
+use crate::infra::sqlite::{
+    AdminAuthenticationResult, AttendanceApprovalOperation, AuthenticatedAdmin, SqliteRepository,
+};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -8,14 +10,13 @@ use axum::{
 };
 use pasori_core::domain::audit::NewAuditLog;
 use pasori_core::domain::employee::{EmployeePatch, NewEmployee};
-use pasori_core::domain::punch::{NewPunchEvent, PunchEvent, PunchPatch};
+use pasori_core::domain::punch::NewPunchEvent;
 use pasori_core::domain::request::{
     AttendanceRequest, AttendanceRequestStatus, AttendanceRequestType,
 };
 use pasori_core::port::policy::PunchEventType;
 use pasori_core::port::repo::{
-    AttendanceRequestRepository, AuditLogRepository, CardRepository, EmployeeRepository,
-    PunchRepository, RepoError,
+    AttendanceRequestRepository, AuditLogRepository, CardRepository, EmployeeRepository, RepoError,
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -429,75 +430,13 @@ async fn approve_attendance_request(
         .await
         .map_err(repo_error_to_status)?
         .ok_or(StatusCode::NOT_FOUND)?;
+    let operation = build_approval_operation(&state.repo, &request).await?;
 
-    let reviewed = state
+    let applied = state
         .repo
-        .review_attendance_request(
-            id,
-            admin.id,
-            AttendanceRequestStatus::Approved,
-            input.review_note.clone(),
-        )
+        .approve_attendance_request_atomically(id, admin.id, input.review_note.clone(), operation)
         .await
         .map_err(repo_error_to_status)?;
-
-    let applied_event_id = match request.request_type {
-        AttendanceRequestType::Correction => {
-            let (before_punch, updated_punch) =
-                apply_correction_request(&state.repo, &request).await?;
-            append_punch_update_audit(&state, &admin, &before_punch, &updated_punch, id).await;
-            updated_punch.id
-        }
-        AttendanceRequestType::MissingIn | AttendanceRequestType::MissingOut => {
-            let punch = create_missing_punch(&state.repo, &request).await?;
-            if let Err(e) = state
-                .repo
-                .append(NewAuditLog {
-                    actor_type: "admin".to_string(),
-                    actor_id: Some(admin.id.to_string()),
-                    action: "punch.create_manual".to_string(),
-                    target_type: "punch_event".to_string(),
-                    target_id: Some(punch.id.to_string()),
-                    before_json: None,
-                    after_json: serde_json::to_string(&punch).ok(),
-                    metadata_json: Some(
-                        serde_json::json!({
-                            "request_type": format!("{:?}", request.request_type),
-                            "attendance_request_id": id,
-                        })
-                        .to_string(),
-                    ),
-                })
-                .await
-            {
-                tracing::error!(error = %e, action = "punch.create_manual", "audit log append failed");
-            }
-            punch.id
-        }
-        _ => return Err(StatusCode::CONFLICT),
-    };
-
-    let applied = AttendanceRequestRepository::update_status(
-        &*state.repo,
-        id,
-        AttendanceRequestStatus::Applied,
-        Some(applied_event_id),
-    )
-    .await
-    .map_err(repo_error_to_status)?;
-
-    append_attendance_request_audit(
-        &state,
-        &admin,
-        "request.approved",
-        &request,
-        &reviewed,
-        serde_json::json!({
-            "review_note": input.review_note,
-            "applied_event_id": applied_event_id,
-        }),
-    )
-    .await;
 
     Ok(Json(applied))
 }
@@ -509,33 +448,11 @@ async fn reject_attendance_request(
     Json(input): Json<AttendanceRequestReviewInput>,
 ) -> Result<Json<AttendanceRequest>, StatusCode> {
     let admin = authenticate_admin_request(&state, &headers).await?;
-    let request = AttendanceRequestRepository::find(&*state.repo, id)
-        .await
-        .map_err(repo_error_to_status)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-
     let rejected = state
         .repo
-        .review_attendance_request(
-            id,
-            admin.id,
-            AttendanceRequestStatus::Rejected,
-            input.review_note.clone(),
-        )
+        .reject_attendance_request_atomically(id, admin.id, input.review_note.clone())
         .await
         .map_err(repo_error_to_status)?;
-
-    append_attendance_request_audit(
-        &state,
-        &admin,
-        "request.rejected",
-        &request,
-        &rejected,
-        serde_json::json!({
-            "review_note": input.review_note,
-        }),
-    )
-    .await;
 
     Ok(Json(rejected))
 }
@@ -654,10 +571,22 @@ fn merge_login_metadata(base_json: String, extra: serde_json::Value) -> String {
     base.to_string()
 }
 
-async fn apply_correction_request(
+async fn build_approval_operation(
     repo: &SqliteRepository,
     request: &AttendanceRequest,
-) -> Result<(PunchEvent, PunchEvent), StatusCode> {
+) -> Result<AttendanceApprovalOperation, StatusCode> {
+    match request.request_type {
+        AttendanceRequestType::Correction => build_correction_operation(request),
+        AttendanceRequestType::MissingIn | AttendanceRequestType::MissingOut => {
+            build_missing_punch_operation(repo, request).await
+        }
+        _ => Err(StatusCode::CONFLICT),
+    }
+}
+
+fn build_correction_operation(
+    request: &AttendanceRequest,
+) -> Result<AttendanceApprovalOperation, StatusCode> {
     let payload: CorrectionRequestPayload = serde_json::from_str(&request.requested_payload_json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let target_date = parse_date(&payload.date).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -671,33 +600,18 @@ async fn apply_correction_request(
 
     let from = day_start_in_tokyo(target_date).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let to = day_end_in_tokyo(target_date).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let punches = repo
-        .list_in_range(request.employee_id, &from, &to)
-        .await
-        .map_err(repo_error_to_status)?;
-    let before_punch = punches
-        .into_iter()
-        .find(|punch| punch.event_type == target_event_type)
-        .ok_or(StatusCode::CONFLICT)?;
-    let corrected_at = before_punch
-        .occurred_at
-        .date()
+    let corrected_at = target_date
         .at(correction_time.0, correction_time.1, 0, 0)
         .in_tz("Asia/Tokyo")
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let updated_punch = PunchRepository::update(
-        repo,
-        before_punch.id,
-        PunchPatch {
-            event_type: Some(target_event_type),
-            occurred_at: Some(corrected_at),
-        },
-        "admin approved correction".to_string(),
-    )
-    .await
-    .map_err(repo_error_to_status)?;
 
-    Ok((before_punch, updated_punch))
+    Ok(AttendanceApprovalOperation::Correction {
+        from,
+        to,
+        target_event_type,
+        corrected_at,
+        reason: "admin approved correction".to_string(),
+    })
 }
 
 #[derive(Deserialize)]
@@ -705,10 +619,10 @@ struct MissingPunchPayload {
     time: String,
 }
 
-async fn create_missing_punch(
+async fn build_missing_punch_operation(
     repo: &SqliteRepository,
     request: &AttendanceRequest,
-) -> Result<PunchEvent, StatusCode> {
+) -> Result<AttendanceApprovalOperation, StatusCode> {
     let payload: MissingPunchPayload = serde_json::from_str(&request.requested_payload_json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let time = parse_hhmm_time(&payload.time).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -731,9 +645,8 @@ async fn create_missing_punch(
         .in_tz("Asia/Tokyo")
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let event = PunchRepository::insert(
-        repo,
-        NewPunchEvent {
+    Ok(AttendanceApprovalOperation::MissingPunch {
+        event: NewPunchEvent {
             id: uuid::Uuid::now_v7(),
             employee_id: request.employee_id,
             card_id,
@@ -741,68 +654,7 @@ async fn create_missing_punch(
             occurred_at,
             source: "lineworks".to_string(),
         },
-    )
-    .await
-    .map_err(repo_error_to_status)?;
-
-    Ok(event)
-}
-
-async fn append_attendance_request_audit(
-    state: &AdminAppState,
-    admin: &AuthenticatedAdmin,
-    action: &str,
-    before: &AttendanceRequest,
-    after: &AttendanceRequest,
-    metadata: serde_json::Value,
-) {
-    if let Err(e) = state
-        .repo
-        .append(NewAuditLog {
-            actor_type: "admin".to_string(),
-            actor_id: Some(admin.id.to_string()),
-            action: action.to_string(),
-            target_type: "attendance_request".to_string(),
-            target_id: Some(after.id.to_string()),
-            before_json: serde_json::to_string(before).ok(),
-            after_json: serde_json::to_string(after).ok(),
-            metadata_json: Some(metadata.to_string()),
-        })
-        .await
-    {
-        tracing::error!(error = %e, action = action, "audit log append failed");
-    }
-}
-
-async fn append_punch_update_audit(
-    state: &AdminAppState,
-    admin: &AuthenticatedAdmin,
-    before: &PunchEvent,
-    after: &PunchEvent,
-    request_id: Uuid,
-) {
-    if let Err(e) = state
-        .repo
-        .append(NewAuditLog {
-            actor_type: "admin".to_string(),
-            actor_id: Some(admin.id.to_string()),
-            action: "punch.update".to_string(),
-            target_type: "punch_event".to_string(),
-            target_id: Some(after.id.to_string()),
-            before_json: serde_json::to_string(before).ok(),
-            after_json: serde_json::to_string(after).ok(),
-            metadata_json: Some(
-                serde_json::json!({
-                    "reason": "lineworks request approved",
-                    "attendance_request_id": request_id,
-                })
-                .to_string(),
-            ),
-        })
-        .await
-    {
-        tracing::error!(error = %e, action = "punch.update", "audit log append failed");
-    }
+    })
 }
 
 #[derive(Deserialize)]
