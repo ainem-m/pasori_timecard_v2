@@ -475,7 +475,11 @@ impl ShiftRepository for SqliteRepository {
 #[async_trait]
 impl AuditLogRepository for SqliteRepository {
     async fn append(&self, entry: NewAuditLog) -> Result<(), RepoError> {
-        let mut tx = self.pool.begin().await.map_err(to_repo_error)?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(to_repo_error)?;
         insert_audit_log_in_tx(&mut tx, entry).await?;
         tx.commit().await.map_err(to_repo_error)?;
 
