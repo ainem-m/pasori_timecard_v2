@@ -57,6 +57,7 @@
   - `prev_hash`: 直前の chain entry の `entry_hash`
   - `entry_hash`: audit entry の canonical payload と `prev_hash` から算出した SHA-256 hex
   - migration 前に存在する `prev_hash = NULL`, `entry_hash = NULL` の行は legacy entry として扱い、chain 検証対象外にする
+- 単独の監査ログ追記は SQLite `BEGIN IMMEDIATE` transaction で `prev_hash` 読み取り前に write lock を取得し、同時追記による chain fork を防ぐ
 - chain 検証は、監査ログ本文・順序・`prev_hash` の不整合を検出する
 - 日次 audit digest は、対象日の `entry_hash` 列から SHA-256 hex として算出できる
 - OS 管理者権限で DB ファイルを直接置換・改変できる脅威に対しては、DB 内 chain だけでは完全防御しない。検知力を高めるには日次 digest を DB 外へ保存する必要がある
