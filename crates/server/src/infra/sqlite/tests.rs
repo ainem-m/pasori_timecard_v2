@@ -4,6 +4,7 @@ use pasori_core::port::policy::PunchEventType;
 use sha2::{Digest, Sha384};
 use sqlx::sqlite::SqlitePoolOptions;
 use std::str::FromStr;
+use std::sync::Arc;
 
 async fn setup_db() -> SqlitePool {
     let pool = SqlitePoolOptions::new()
@@ -697,4 +698,71 @@ async fn calculates_daily_audit_digest() {
     assert_eq!(digest.digest_hash.len(), 64);
     assert!(digest.first_entry_hash.is_some());
     assert!(digest.last_entry_hash.is_some());
+}
+
+#[tokio::test]
+// 同時 audit_log 追記でも prev_hash は直列化され、hash chain は fork しない。
+async fn serializes_concurrent_audit_log_appends() {
+    let database_url = format!("sqlite:file:{}?mode=memory&cache=shared", Uuid::now_v7());
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .expect("failed to connect to shared memory db");
+
+    sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .expect("failed to run migrations");
+
+    let repo = Arc::new(SqliteRepository::new(pool.clone()));
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for index in 0..12 {
+        let repo = Arc::clone(&repo);
+        tasks.spawn(async move {
+            repo.append(NewAuditLog {
+                actor_type: "system".to_string(),
+                actor_id: None,
+                action: format!("test.concurrent.{index}"),
+                target_type: "test".to_string(),
+                target_id: None,
+                before_json: None,
+                after_json: Some(format!(r#"{{"value":{index}}}"#)),
+                metadata_json: None,
+            })
+            .await
+        });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        result
+            .expect("audit append task should not panic")
+            .expect("audit append should succeed");
+    }
+
+    let verification = repo
+        .verify_audit_log_hash_chain()
+        .await
+        .expect("verify audit log chain");
+    let duplicate_prev_hash_count = sqlx::query(
+        r#"
+        SELECT COUNT(*) AS count
+        FROM (
+            SELECT prev_hash
+            FROM audit_log
+            WHERE prev_hash IS NOT NULL
+            GROUP BY prev_hash
+            HAVING COUNT(*) > 1
+        )
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count duplicate prev_hash")
+    .get::<i64, _>("count");
+
+    assert!(verification.is_valid);
+    assert_eq!(verification.checked_entries, 12);
+    assert_eq!(duplicate_prev_hash_count, 0);
 }
