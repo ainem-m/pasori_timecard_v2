@@ -1,4 +1,4 @@
-use jiff::Zoned;
+use jiff::{Zoned, civil::Date};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -14,6 +14,8 @@ pub struct AuditLog {
     pub after_json: Option<String>,
     pub metadata_json: Option<String>,
     pub created_at: Zoned,
+    pub prev_hash: Option<String>,
+    pub entry_hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,4 +37,23 @@ pub struct AuditLogFilter {
     pub target_id: Option<String>,
     pub from: Option<Zoned>,
     pub to: Option<Zoned>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditLogChainVerification {
+    pub is_valid: bool,
+    pub checked_entries: usize,
+    pub legacy_entries: usize,
+    pub first_invalid_audit_log_id: Option<Uuid>,
+    pub first_invalid_action: Option<String>,
+    pub last_valid_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditDigest {
+    pub date: Date,
+    pub entry_count: usize,
+    pub first_entry_hash: Option<String>,
+    pub last_entry_hash: Option<String>,
+    pub digest_hash: String,
 }
